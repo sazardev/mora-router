@@ -4,7 +4,10 @@
 2. Validación de payloads con tags en structs  
    • Integrar validadores (p.ej. `required,min=3`) sobre tus bindings JSON/XML.  
 3. Autenticación y autorización out-of-the-box  
-   • Middlewares JWT, OAuth2, sesiones, CSRF, permisos de rol.  
+   • Middlewares JWT, OAuth2, sesiones, CSRF, permisos de rol. 
+
+--- 
+
 4. Soporte GraphQL y WebSockets  
    • Montaje de endpoints GraphQL y manejadores WS integrados en el mismo router.  
 5. Servir assets y SPA  

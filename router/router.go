@@ -3,6 +3,9 @@ package router
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -10,7 +13,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -380,7 +385,7 @@ func JSON(w http.ResponseWriter, status int, data interface{}) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
-// BindJSON decodifica JSON en struct T antes de llamar al handler.
+// BindJSON decodifica JSON en struct T antes de llamar al handler y valida tags `validate`.
 func BindJSON[T any](h func(http.ResponseWriter, *http.Request, Params, T)) HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request, p Params) {
 		var obj T
@@ -389,11 +394,15 @@ func BindJSON[T any](h func(http.ResponseWriter, *http.Request, Params, T)) Hand
 			http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
 			return
 		}
+		if err := validate(obj); err != nil {
+			http.Error(w, fmt.Sprintf("validation error: %v", err), http.StatusBadRequest)
+			return
+		}
 		h(w, r, p, obj)
 	}
 }
 
-// BindXML decodifica XML en struct T antes de llamar al handler.
+// BindXML decodifica XML en struct T antes de llamar al handler y valida tags `validate`.
 func BindXML[T any](h func(http.ResponseWriter, *http.Request, Params, T)) HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request, p Params) {
 		var obj T
@@ -402,8 +411,52 @@ func BindXML[T any](h func(http.ResponseWriter, *http.Request, Params, T)) Handl
 			http.Error(w, fmt.Sprintf("invalid XML: %v", err), http.StatusBadRequest)
 			return
 		}
+		if err := validate(obj); err != nil {
+			http.Error(w, fmt.Sprintf("validation error: %v", err), http.StatusBadRequest)
+			return
+		}
 		h(w, r, p, obj)
 	}
+}
+
+// validate inspecciona tags `validate` en campos de structs y aplica reglas básicas.
+func validate(obj any) error {
+	v := reflect.ValueOf(obj)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	t := v.Type()
+	for i := 0; i < v.NumField(); i++ {
+		field := t.Field(i)
+		tag := field.Tag.Get("validate")
+		if tag == "" {
+			continue
+		}
+		parts := strings.Split(tag, ",")
+		fval := v.Field(i)
+		for _, rule := range parts {
+			switch {
+			case rule == "required":
+				zero := reflect.Zero(fval.Type()).Interface()
+				if reflect.DeepEqual(fval.Interface(), zero) {
+					return fmt.Errorf("%s is required", field.Name)
+				}
+			case strings.HasPrefix(rule, "min="):
+				min, _ := strconv.Atoi(strings.TrimPrefix(rule, "min="))
+				switch fval.Kind() {
+				case reflect.String:
+					if len(fval.String()) < min {
+						return fmt.Errorf("%s length must be >= %d", field.Name, min)
+					}
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					if fval.Int() < int64(min) {
+						return fmt.Errorf("%s must be >= %d", field.Name, min)
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // splitPath divide la ruta en segmentos, eliminando barras inicial y final.
@@ -651,5 +704,122 @@ func WithI18n(translations map[string]map[string]string) Option {
 	return func(r *MoraRouter) {
 		// translations[rutaNombre][lang] = patrón traducido
 		r.i18n = translations
+	}
+}
+
+// WithSwagger registra un endpoint /openapi.json que expone la especificación OpenAPI generada automáticamente.
+func WithSwagger() Option {
+	return func(r *MoraRouter) {
+		r.Get("/openapi.json", func(w http.ResponseWriter, req *http.Request, p Params) {
+			JSON(w, http.StatusOK, r.BuildOpenAPISpec())
+		})
+	}
+}
+
+// BuildOpenAPISpec genera un mapa con la especificación OpenAPI 3.0 a partir de las rutas registradas.
+func (r *MoraRouter) BuildOpenAPISpec() map[string]interface{} {
+	paths := make(map[string]map[string]interface{})
+	for _, rt := range r.routes {
+		if paths[rt.pattern] == nil {
+			paths[rt.pattern] = make(map[string]interface{})
+		}
+		// parámetros de path
+		var params []map[string]interface{}
+		for _, seg := range rt.segments {
+			if seg.name != "" {
+				params = append(params, map[string]interface{}{
+					"name":     seg.name,
+					"in":       "path",
+					"required": true,
+					"schema":   map[string]string{"type": "string"},
+				})
+			}
+		}
+		paths[rt.pattern][strings.ToLower(rt.method)] = map[string]interface{}{
+			"parameters": params,
+			"responses":  map[string]interface{}{"200": map[string]string{"description": "OK"}},
+		}
+	}
+	return map[string]interface{}{
+		"openapi": "3.0.0",
+		"info":    map[string]string{"title": "Mora API", "version": "1.0.0"},
+		"paths":   paths,
+	}
+}
+
+// WithJWT agrega un middleware de autenticación JWT HMAC-SHA256 usando una clave secreta.
+func WithJWT(secret string) Option {
+	return func(r *MoraRouter) {
+		r.Use(jwtMiddleware([]byte(secret)))
+	}
+}
+
+func jwtMiddleware(secret []byte) Middleware {
+	return func(next HandlerFunc) HandlerFunc {
+		return func(w http.ResponseWriter, req *http.Request, p Params) {
+			auth := req.Header.Get("Authorization")
+			if !strings.HasPrefix(auth, "Bearer ") {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			token := strings.TrimPrefix(auth, "Bearer ")
+			parts := strings.Split(token, ".")
+			if len(parts) != 3 {
+				http.Error(w, "Invalid token", http.StatusUnauthorized)
+				return
+			}
+			header, payload, sig := parts[0], parts[1], parts[2]
+			data := header + "." + payload
+			mac := hmac.New(sha256.New, secret)
+			mac.Write([]byte(data))
+			expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+			if !hmac.Equal([]byte(expected), []byte(sig)) {
+				http.Error(w, "Invalid signature", http.StatusUnauthorized)
+				return
+			}
+			decoded, err := base64.RawURLEncoding.DecodeString(payload)
+			if err != nil {
+				http.Error(w, "Invalid payload", http.StatusUnauthorized)
+				return
+			}
+			var claims map[string]any
+			if err := json.Unmarshal(decoded, &claims); err != nil {
+				http.Error(w, "Invalid claims", http.StatusUnauthorized)
+				return
+			}
+			ctx := context.WithValue(req.Context(), contextKey("claims"), claims)
+			req2 := req.WithContext(ctx)
+			next(w, req2, p)
+		}
+	}
+}
+
+// GetClaims extrae los claims JWT del contexto de la petición.
+func GetClaims(req *http.Request) map[string]any {
+	if v, ok := req.Context().Value(contextKey("claims")).(map[string]any); ok {
+		return v
+	}
+	return nil
+}
+
+// RequireRole crea un middleware que verifica que 'roles' en los claims JWT incluya el rol dado.
+func RequireRole(role string) Middleware {
+	return func(next HandlerFunc) HandlerFunc {
+		return func(w http.ResponseWriter, req *http.Request, p Params) {
+			claims := GetClaims(req)
+			if claims == nil {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			if roles, ok := claims["roles"].([]interface{}); ok {
+				for _, r := range roles {
+					if r == role {
+						next(w, req, p)
+						return
+					}
+				}
+			}
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		}
 	}
 }
