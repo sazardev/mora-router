@@ -248,6 +248,14 @@ func (r *MoraRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+	// traducir ruta según i18n y Accept-Language
+	lang := parseAcceptLanguage(req.Header.Get("Accept-Language"))
+	if transMap, ok := r.i18n[lang]; ok {
+		if newPath, ok2 := transMap[path]; ok2 {
+			path = newPath
+			req.URL.Path = path
+		}
+	}
 	// particionar path
 	pathSegs := splitPath(path)
 	// recolectar métodos permitidos para esta ruta
@@ -821,5 +829,179 @@ func RequireRole(role string) Middleware {
 			}
 			http.Error(w, "Forbidden", http.StatusForbidden)
 		}
+	}
+}
+
+// WithGraphQL monta un handler GraphQL en la ruta dada.
+func WithGraphQL(path string, h http.Handler) Option {
+	return func(r *MoraRouter) {
+		r.Mount(path, h)
+	}
+}
+
+// WithWebSocket monta un handler WebSocket en la ruta dada.
+func WithWebSocket(path string, h http.Handler) Option {
+	return func(r *MoraRouter) {
+		r.Mount(path, h)
+	}
+}
+
+// Static sirve archivos estáticos desde un directorio bajo el prefijo.
+func (r *MoraRouter) Static(prefix, dir string) {
+	fs := http.FileServer(http.Dir(dir))
+	r.Mount(prefix, http.StripPrefix(prefix, fs))
+}
+
+// SPA sirve una single-page app: archivos estáticos y fallback al index.
+func (r *MoraRouter) SPA(prefix, dir, indexFile string) {
+	r.Static(prefix, dir)
+	r.Get(prefix+"/*filepath", func(w http.ResponseWriter, req *http.Request, p Params) {
+		http.ServeFile(w, req, filepath.Join(dir, indexFile))
+	})
+}
+
+// parseAcceptLanguage obtiene el primer lenguaje de Accept-Language.
+func parseAcceptLanguage(header string) string {
+	if header == "" {
+		return ""
+	}
+	parts := strings.Split(header, ",")
+	lang := strings.TrimSpace(strings.SplitN(parts[0], ";", 2)[0])
+	return lang
+}
+
+// ResourceController define los métodos que un controlador de recursos puede implementar.
+type ResourceController interface {
+	Index(http.ResponseWriter, *http.Request, Params)
+	Show(http.ResponseWriter, *http.Request, Params)
+	Create(http.ResponseWriter, *http.Request, Params)
+	Update(http.ResponseWriter, *http.Request, Params)
+	Delete(http.ResponseWriter, *http.Request, Params)
+}
+
+// DefaultController es una implementación vacía de ResourceController para embeber y extender.
+type DefaultController struct{}
+
+func (c DefaultController) Index(w http.ResponseWriter, r *http.Request, p Params) {
+	http.Error(w, "Not Implemented", http.StatusNotImplemented)
+}
+func (c DefaultController) Show(w http.ResponseWriter, r *http.Request, p Params) {
+	http.Error(w, "Not Implemented", http.StatusNotImplemented)
+}
+func (c DefaultController) Create(w http.ResponseWriter, r *http.Request, p Params) {
+	http.Error(w, "Not Implemented", http.StatusNotImplemented)
+}
+func (c DefaultController) Update(w http.ResponseWriter, r *http.Request, p Params) {
+	http.Error(w, "Not Implemented", http.StatusNotImplemented)
+}
+func (c DefaultController) Delete(w http.ResponseWriter, r *http.Request, p Params) {
+	http.Error(w, "Not Implemented", http.StatusNotImplemented)
+}
+
+// Resource registra automáticamente todas las rutas REST para un recurso.
+func (r *MoraRouter) Resource(pathPrefix string, controller ResourceController) {
+	// Normalizar prefix
+	prefix := "/" + strings.Trim(pathPrefix, "/")
+
+	// GET /recursos (Index) - listar todos
+	r.Get(prefix, controller.Index)
+
+	// GET /recursos/:id (Show) - mostrar uno
+	r.Get(prefix+"/:id", controller.Show)
+
+	// POST /recursos (Create) - crear uno nuevo
+	r.Post(prefix, controller.Create)
+
+	// PUT/PATCH /recursos/:id (Update) - actualizar uno existente
+	r.Put(prefix+"/:id", controller.Update)
+
+	// DELETE /recursos/:id (Delete) - eliminar uno
+	r.Delete(prefix+"/:id", controller.Delete)
+
+	// Generar nombres para URL reversal
+	resourceName := filepath.Base(prefix)
+	r.Name(resourceName+".index", prefix)
+	r.Name(resourceName+".show", prefix+"/:id")
+	r.Name(resourceName+".create", prefix)
+	r.Name(resourceName+".update", prefix+"/:id")
+	r.Name(resourceName+".delete", prefix+"/:id")
+}
+
+// Macro representa un patrón reutilizable de rutas
+type Macro struct {
+	name        string
+	pattern     string
+	methods     []string
+	middlewares []Middleware
+}
+
+// MacroRegistry almacena las macros disponibles
+var MacroRegistry = map[string]Macro{
+	"detail": {
+		name:    "detail",
+		pattern: "/:id",
+		methods: []string{"GET"},
+	},
+	"list": {
+		name:    "list",
+		pattern: "/",
+		methods: []string{"GET"},
+	},
+	"create": {
+		name:    "create",
+		pattern: "/",
+		methods: []string{"POST"},
+	},
+	"update": {
+		name:    "update",
+		pattern: "/:id",
+		methods: []string{"PUT", "PATCH"},
+	},
+	"delete": {
+		name:    "delete",
+		pattern: "/:id",
+		methods: []string{"DELETE"},
+	},
+	"api": {
+		name:    "api",
+		pattern: "/api",
+		methods: []string{"GET", "POST", "PUT", "DELETE"},
+	},
+}
+
+// RegisterMacro registra una nueva macro para usar en rutas
+func RegisterMacro(name, pattern string, methods []string, middlewares ...Middleware) {
+	MacroRegistry[name] = Macro{
+		name:        name,
+		pattern:     pattern,
+		methods:     methods,
+		middlewares: middlewares,
+	}
+}
+
+// UseMacro aplica una macro registrada a una ruta con un manejador
+func (r *MoraRouter) UseMacro(prefix, macroName string, handler HandlerFunc) {
+	macro, ok := MacroRegistry[macroName]
+	if !ok {
+		panic(fmt.Sprintf("Macro no registrada: %s", macroName))
+	}
+
+	path := prefix + macro.pattern
+
+	// Aplicar middlewares específicos de la macro
+	wrapped := handler
+	if len(macro.middlewares) > 0 {
+		wrapped = applyMiddlewares(handler, macro.middlewares)
+	}
+
+	// Registrar rutas para todos los métodos de la macro
+	for _, method := range macro.methods {
+		r.Handle(method, path, wrapped)
+	}
+
+	// Nombrar la ruta para URL reversal
+	if prefix != "" && prefix != "/" {
+		base := filepath.Base(strings.TrimRight(prefix, "/"))
+		r.Name(base+"."+macro.name, path)
 	}
 }

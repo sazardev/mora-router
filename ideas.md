@@ -14,6 +14,7 @@
    • Helpers dedicados para “single-page apps” y cache de ficheros estáticos.  
 6. Internacionalización de rutas y mensajes  
    • Traducción de paths según `Accept-Lang`, helpers para localización de errores.  
+
 7. Generadores de código y CLI  
    • `mora gen` para scaffold de handlers, controladores, modelos a partir de anotaciones.  
 8. Arquitectura de plugins  
