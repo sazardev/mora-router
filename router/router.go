@@ -250,6 +250,8 @@ func (r *MoraRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	pathSegs := splitPath(path)
 	// recolectar métodos permitidos para esta ruta
 	var allowed []string
+	for _, rt := range r.routes {
+		// verificar coincidencia de segmentos ignorando método
 		if matchSegments(rt.segments, pathSegs, nil) {
 			allowed = append(allowed, rt.method)
 		}
@@ -627,4 +629,30 @@ func Redirect(w http.ResponseWriter, r *http.Request, urlStr string, code int) {
 func FileDownload(w http.ResponseWriter, r *http.Request, filePath string) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(filePath)))
 	http.ServeFile(w, r, filePath)
+}
+
+// WithHotReload habilita recarga automática de rutas al detectar cambios en el archivo dado.
+func WithHotReload(filePath string, interval time.Duration) Option {
+	return func(r *MoraRouter) {
+		go func() {
+			var lastMod time.Time
+			for {
+				if fi, err := os.Stat(filePath); err == nil {
+					if fi.ModTime().After(lastMod) {
+						lastMod = fi.ModTime()
+						// TODO: invocar lógica de recarga (p.ej. r.reloadRoutes())
+					}
+				}
+				time.Sleep(interval)
+			}
+		}()
+	}
+}
+
+// WithI18n configura mapas de traducción de rutas por idioma.
+func WithI18n(translations map[string]map[string]string) Option {
+	return func(r *MoraRouter) {
+		// translations[rutaNombre][lang] = patrón traducido
+		r.i18n = translations
+	}
 }
