@@ -21,49 +21,6 @@ import (
 	"time"
 )
 
-type Params map[string]string
-
-type HandlerFunc func(http.ResponseWriter, *http.Request, Params)
-
-type Middleware func(HandlerFunc) HandlerFunc
-
-type Option func(*MoraRouter)
-
-// MoraRouter es un enrutador personalizable estilo Mora.
-type MoraRouter struct {
-	routes             []route
-	middlewares        []Middleware
-	notFound           HandlerFunc
-	namedRoutes        map[string]string
-	mounts             []mount
-	middlewareRegistry map[string]Middleware
-	i18n               map[string]map[string]string
-}
-
-// Alias para compatibilidad
-type Router = MoraRouter
-
-// segment representa un segmento de ruta, estático o dinámico con regex opcional.
-type segment struct {
-	literal  string         // valor a comparar para segmentos estáticos
-	name     string         // nombre de parámetro para segmentos dinámicos
-	regex    *regexp.Regexp // patrón para validar el valor dinámico
-	wildcard bool           // si es segmento comodín que captura el resto de la ruta
-}
-
-type route struct {
-	method   string
-	pattern  string
-	segments []segment
-	handler  HandlerFunc
-}
-
-// mount representa una ruta montada de http.Handler con prefijo.
-type mount struct {
-	prefix  string
-	handler http.Handler
-}
-
 // New crea un nuevo enrutador MoraRouter con opciones.
 func NewMoraRouter(opts ...Option) *MoraRouter {
 	r := &MoraRouter{
@@ -146,12 +103,6 @@ func versioningMiddleware(headerName, defaultVersion string) Middleware {
 // Use permite agregar middlewares directamente.
 func (r *MoraRouter) Use(mw ...Middleware) {
 	r.middlewares = append(r.middlewares, mw...)
-}
-
-// Group crea un subgrupo de rutas con prefijo.
-type RouteGroup struct {
-	prefix string
-	router *MoraRouter
 }
 
 // Group inicia un nuevo grupo enrutado.
@@ -507,11 +458,6 @@ func (r *MoraRouter) URL(name string, params ...string) (string, error) {
 	return "/" + strings.Join(result, "/"), nil
 }
 
-// context key for params embedding
-type contextKey string
-
-const paramsKey contextKey = "routerParams"
-
 // Param obtiene un parámetro de ruta desde el context.Context de la petición
 func Param(r *http.Request, name string) string {
 	if p, ok := r.Context().Value(paramsKey).(Params); ok {
@@ -574,13 +520,6 @@ func WithCache(ttl time.Duration) Option {
 	}
 }
 
-type cacheEntry struct {
-	header http.Header
-	status int
-	body   []byte
-	expire time.Time
-}
-
 var (
 	cacheMu    sync.Mutex
 	cacheStore = map[string]cacheEntry{}
@@ -614,13 +553,6 @@ func cacheMiddleware(ttl time.Duration) Middleware {
 	}
 }
 
-type responseBuffer struct {
-	http.ResponseWriter
-	buf    *bytes.Buffer
-	header http.Header
-	status int
-}
-
 func (r *responseBuffer) Header() http.Header { return r.header }
 func (r *responseBuffer) Write(b []byte) (int, error) {
 	r.buf.Write(b)
@@ -636,11 +568,6 @@ func WithRateLimit(max int, window time.Duration) Option {
 	return func(r *MoraRouter) {
 		r.Use(rateLimitMiddleware(max, window))
 	}
-}
-
-type rateInfo struct {
-	count     int
-	windowEnd time.Time
 }
 
 var (
@@ -870,18 +797,6 @@ func parseAcceptLanguage(header string) string {
 	return lang
 }
 
-// ResourceController define los métodos que un controlador de recursos puede implementar.
-type ResourceController interface {
-	Index(http.ResponseWriter, *http.Request, Params)
-	Show(http.ResponseWriter, *http.Request, Params)
-	Create(http.ResponseWriter, *http.Request, Params)
-	Update(http.ResponseWriter, *http.Request, Params)
-	Delete(http.ResponseWriter, *http.Request, Params)
-}
-
-// DefaultController es una implementación vacía de ResourceController para embeber y extender.
-type DefaultController struct{}
-
 func (c DefaultController) Index(w http.ResponseWriter, r *http.Request, p Params) {
 	http.Error(w, "Not Implemented", http.StatusNotImplemented)
 }
@@ -925,14 +840,6 @@ func (r *MoraRouter) Resource(pathPrefix string, controller ResourceController) 
 	r.Name(resourceName+".create", prefix)
 	r.Name(resourceName+".update", prefix+"/:id")
 	r.Name(resourceName+".delete", prefix+"/:id")
-}
-
-// Macro representa un patrón reutilizable de rutas
-type Macro struct {
-	name        string
-	pattern     string
-	methods     []string
-	middlewares []Middleware
 }
 
 // MacroRegistry almacena las macros disponibles
