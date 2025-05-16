@@ -1,13 +1,19 @@
 package router
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 )
 
 type Params map[string]string
@@ -28,6 +34,7 @@ type MoraRouter struct {
 	middlewareRegistry map[string]Middleware
 	apiVersionHeader   string              // header name for API versioning
 	supportedVersions  map[string]struct{} // allowed version prefixes
+	i18n               map[string]map[string]string
 }
 
 // Alias para compatibilidad
@@ -243,8 +250,6 @@ func (r *MoraRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	pathSegs := splitPath(path)
 	// recolectar métodos permitidos para esta ruta
 	var allowed []string
-	for _, rt := range r.routes {
-		// verificar coincidencia de segmentos ignorando método
 		if matchSegments(rt.segments, pathSegs, nil) {
 			allowed = append(allowed, rt.method)
 		}
@@ -266,7 +271,9 @@ func (r *MoraRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		params := make(Params)
 		if matchSegments(rt.segments, pathSegs, params) {
-			rt.handler(w, req, params)
+			// embed en Context
+			req2 := req.WithContext(context.WithValue(req.Context(), paramsKey, params))
+			rt.handler(w, req2, params)
 			return
 		}
 	}
@@ -438,4 +445,186 @@ func (r *MoraRouter) URL(name string, params ...string) (string, error) {
 		return "", fmt.Errorf("demasiados parámetros para la ruta %s", name)
 	}
 	return "/" + strings.Join(result, "/"), nil
+}
+
+// context key for params embedding
+type contextKey string
+
+const paramsKey contextKey = "routerParams"
+
+// Param obtiene un parámetro de ruta desde el context.Context de la petición
+func Param(r *http.Request, name string) string {
+	if p, ok := r.Context().Value(paramsKey).(Params); ok {
+		return p[name]
+	}
+	return ""
+}
+
+// WithMetrics registra un endpoint /metrics y un middleware para latencias
+func WithMetrics() Option {
+	return func(r *MoraRouter) {
+		// middleware
+		m := metricsMiddleware
+		r.middlewareRegistry["metrics"] = m
+		r.middlewares = append(r.middlewares, m)
+		// endpoint
+		r.Get("/metrics", func(w http.ResponseWriter, req *http.Request, p Params) {
+			metricsHandler(w, req)
+		})
+	}
+}
+
+var (
+	metricsMu sync.Mutex
+	latencies []time.Duration
+)
+
+func metricsMiddleware(next HandlerFunc) HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request, p Params) {
+		start := time.Now()
+		next(w, r, p)
+		dur := time.Since(start)
+		metricsMu.Lock()
+		latencies = append(latencies, dur)
+		metricsMu.Unlock()
+	}
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
+	total := time.Duration(0)
+	for _, d := range latencies {
+		total += d
+	}
+	avg := time.Duration(0)
+	if len(latencies) > 0 {
+		avg = total / time.Duration(len(latencies))
+	}
+	fmt.Fprintf(w, "# HELP http_handler_latency_seconds_average average latency in seconds\n")
+	fmt.Fprintf(w, "http_handler_latency_seconds_average %f\n", avg.Seconds())
+	fmt.Fprintf(w, "# HELP http_handler_requests_total total handled requests\n")
+	fmt.Fprintf(w, "http_handler_requests_total %d\n", len(latencies))
+}
+
+// WithCache activa un middleware de caching en memoria por ruta
+func WithCache(ttl time.Duration) Option {
+	return func(r *MoraRouter) {
+		r.Use(cacheMiddleware(ttl))
+	}
+}
+
+type cacheEntry struct {
+	header http.Header
+	status int
+	body   []byte
+	expire time.Time
+}
+
+var (
+	cacheMu    sync.Mutex
+	cacheStore = map[string]cacheEntry{}
+)
+
+func cacheMiddleware(ttl time.Duration) Middleware {
+	return func(next HandlerFunc) HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request, p Params) {
+			key := r.Method + ":" + r.URL.RequestURI()
+			cacheMu.Lock()
+			e, ok := cacheStore[key]
+			cacheMu.Unlock()
+			if ok && time.Now().Before(e.expire) {
+				for k, vs := range e.header {
+					for _, v := range vs {
+						w.Header().Add(k, v)
+					}
+				}
+				w.WriteHeader(e.status)
+				w.Write(e.body)
+				return
+			}
+			// capture response
+			buf := &bytes.Buffer{}
+			rw := &responseBuffer{ResponseWriter: w, buf: buf, header: http.Header{}, status: http.StatusOK}
+			next(rw, r, p)
+			cacheMu.Lock()
+			cacheStore[key] = cacheEntry{rw.header, rw.status, buf.Bytes(), time.Now().Add(ttl)}
+			cacheMu.Unlock()
+		}
+	}
+}
+
+type responseBuffer struct {
+	http.ResponseWriter
+	buf    *bytes.Buffer
+	header http.Header
+	status int
+}
+
+func (r *responseBuffer) Header() http.Header { return r.header }
+func (r *responseBuffer) Write(b []byte) (int, error) {
+	r.buf.Write(b)
+	return r.ResponseWriter.Write(b)
+}
+func (r *responseBuffer) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+// WithRateLimit activa un middleware para limitar peticiones por IP
+func WithRateLimit(max int, window time.Duration) Option {
+	return func(r *MoraRouter) {
+		r.Use(rateLimitMiddleware(max, window))
+	}
+}
+
+type rateInfo struct {
+	count     int
+	windowEnd time.Time
+}
+
+var (
+	rateMu  sync.Mutex
+	rateMap = map[string]rateInfo{}
+)
+
+func rateLimitMiddleware(max int, window time.Duration) Middleware {
+	return func(next HandlerFunc) HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request, p Params) {
+			ip := strings.Split(r.RemoteAddr, ":")[0]
+			rateMu.Lock()
+			info := rateMap[ip]
+			now := time.Now()
+			if now.After(info.windowEnd) {
+				info = rateInfo{count: 0, windowEnd: now.Add(window)}
+			}
+			if info.count >= max {
+				rateMu.Unlock()
+				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				return
+			}
+			info.count++
+			rateMap[ip] = info
+			rateMu.Unlock()
+			next(w, r, p)
+		}
+	}
+}
+
+// Handy responders
+
+// Error responde con un código y mensaje simple
+func Error(w http.ResponseWriter, status int, msg string) {
+	http.Error(w, msg, status)
+}
+
+// Redirect envía redirección HTTP
+func Redirect(w http.ResponseWriter, r *http.Request, urlStr string, code int) {
+	http.Redirect(w, r, urlStr, code)
+}
+
+// FileDownload fuerza descarga de un archivo
+func FileDownload(w http.ResponseWriter, r *http.Request, filePath string) {
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(filePath)))
+	http.ServeFile(w, r, filePath)
 }
