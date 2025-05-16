@@ -1,54 +1,33 @@
-Todo el core de tu paquete (desde la creación con `New(With…)` hasta el dispatch en `ServeHTTP`) está en router.go, y las pruebas de lo que ya tienes “listo para usar” en router_test.go.  Aquí tienes algunas ideas de funcionalidades avanzadas que podrías añadir a MoraRouter para convertirlo en un paquete “next-level” al estilo Django/Gorilla/Chi:
 
-1. Named routes y URL reversal  
-   - Asignar un nombre a cada ruta y permitir generar URLs dinámicamente (`router.Name("user_detail", "/users/:id")` → `router.URL("user_detail", "42")`).
+1. Documentación OpenAPI/Swagger automática  
+   • Inspección de rutas, parámetros y esquemas para generar JSON/YAML.  
+2. Validación de payloads con tags en structs  
+   • Integrar validadores (p.ej. `required,min=3`) sobre tus bindings JSON/XML.  
+3. Autenticación y autorización out-of-the-box  
+   • Middlewares JWT, OAuth2, sesiones, CSRF, permisos de rol.  
+4. Soporte GraphQL y WebSockets  
+   • Montaje de endpoints GraphQL y manejadores WS integrados en el mismo router.  
+5. Servir assets y SPA  
+   • Helpers dedicados para “single-page apps” y cache de ficheros estáticos.  
+6. Internacionalización de rutas y mensajes  
+   • Traducción de paths según `Accept-Lang`, helpers para localización de errores.  
+7. Generadores de código y CLI  
+   • `mora gen` para scaffold de handlers, controladores, modelos a partir de anotaciones.  
+8. Arquitectura de plugins  
+   • Permitir paquetes externos que añadan middleware, binding, validadores o adaptadores.  
+9. Métricas y tracing avanzados  
+   • Integración nativa con Prometheus, OpenTelemetry, logs estructurados (Zap, Logrus).  
+10. Health-checks y graceful shutdown  
+    • Endpoints `/healthz`, `/readyz`, hooks para cerrar conexiones/pools ordenadamente.  
+11. Versionado automático de grupos de rutas  
+    • Prefijos `/v1`, `/v2` sin duplicar handlers, con migraciones transparentes.  
+12. Enrutamiento dinámico en caliente  
+    • Recarga de rutas y middlewares sin reiniciar el servidor en modo dev.  
+13. Scaffolding de recursos REST  
+    • `router.Resource("/users", UserController{})` que auto-genera GET/POST/PUT/DELETE.  
+14. Middleware de pruebas y simulación  
+    • Falsificar respuestas, “mock” de backend, inyectar entornos de test fácilmente.  
+15. Inspector de rutas en runtime  
+    • UI web para explorar y probar rutas, ver parámetros, métodos permitidos y payloads.  
 
-2. Validación y tipado de parámetros  
-   - Definir parámetros con tipos o regex (`:id(\\d+)`, `{slug:[a-z\\-]+}`) y validarlos antes de llegar al handler.
-
-3. Wildcards y sub-paths  
-   - Soporte de segmentos comodín (`*filepath`) para servir directorios estáticos o archivos.
-
-4. Enrutadores anidados / sub-routers  
-   - Montar routers independientes con su propio stack de middlewares y prefijo de ruta.
-
-5. Auto-OPTIONS y MethodNotAllowed  
-   - Generar automáticamente respuesta para OPTIONS y 405 cuando el método no encaje.
-
-6. Reverse proxy y mounting  
-   - Montar handlers externos (otros http.Handler) bajo un path.
-
-7. Autogeneración de documentación (OpenAPI/Swagger)  
-   - Inspeccionar rutas para producir JSON/YAML de especificación.
-
-8. Serialización/Deserialización automática  
-   - Bind de JSON/XML a structs en la firma del handler, con validación de campos.
-
-9. Middleware registry y orden configurable  
-   - Registrar middlewares por nombre/etiqueta y activarlos selectivamente por ruta o grupo.
-
-10. Versionado de API  
-    - Prefijos `/v1`, `/v2` con routing transparente según cabecera o URL.
-
-11. Generación de métricas / logging mejorado  
-    - Integración con Prometheus/Logrus, estadísticas de latencia, contadores de código de estado.
-
-12. Caching y rate-limiting embebido  
-    - Middlewares para respuesta en cache y para limitar llamadas por IP/rate.
-
-13. Context embedding  
-    - Extraer params en `context.Context` y proporcionar helpers `router.Param(r, "id")`.
-
-14. Handy responders  
-    - Helpers para errores (404, 500), redirecciones, forzar downloads, etc.
-
-15. Hot reload de rutas  
-    - Recarga automática de definiciones sin reiniciar servidor (por ejemplo en dev).
-
-16. Generadores de código  
-    - Command-line tool que infiera rutas de anotaciones y genere stubs de handlers.
-
-17. Internacionalización (i18n) de rutas  
-    - Definir rutas en múltiples idiomas y resolver según header `Accept-Lang`.
-
-Con esta base, MoraRouter destacará por su ergonomía, flexibilidad y cantidad de características “out-of-the-box”. Dime cuáles de estas te interesan implementar primero y comenzamos.
+Con estas capas tu router sería una “navaja suiza” web en Go: minimal-std, modular, extensible y listo para cualquier tipo de API o aplicación.

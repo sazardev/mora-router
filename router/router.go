@@ -32,8 +32,6 @@ type MoraRouter struct {
 	namedRoutes        map[string]string
 	mounts             []mount
 	middlewareRegistry map[string]Middleware
-	apiVersionHeader   string              // header name for API versioning
-	supportedVersions  map[string]struct{} // allowed version prefixes
 	i18n               map[string]map[string]string
 }
 
@@ -67,7 +65,6 @@ func NewMoraRouter(opts ...Option) *MoraRouter {
 		notFound:           defaultNotFound,
 		namedRoutes:        make(map[string]string),
 		middlewareRegistry: make(map[string]Middleware),
-		supportedVersions:  make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(r)
