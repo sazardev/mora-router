@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"reflect"
 	"regexp"
 	"strings"
 )
@@ -27,8 +26,8 @@ type MoraRouter struct {
 	namedRoutes        map[string]string
 	mounts             []mount
 	middlewareRegistry map[string]Middleware
-	apiVersionHeader   string                       // header name for API versioning
-	supportedVersions  map[string]struct{}          // allowed version prefixes
+	apiVersionHeader   string              // header name for API versioning
+	supportedVersions  map[string]struct{} // allowed version prefixes
 }
 
 // Alias para compatibilidad
@@ -375,51 +374,29 @@ func JSON(w http.ResponseWriter, status int, data interface{}) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
-// validateStruct checks `validate:"required"` tags on struct fields.
-func validateStruct[T any](obj *T) error {
-	v := reflect.ValueOf(obj).Elem()
-	t := v.Type()
-	for i := 0; i < v.NumField(); i++ {
-		field := t.Field(i)
-		if tag := field.Tag.Get("validate"); tag == "required" {
-			fv := v.Field(i)
-			if reflect.DeepEqual(fv.Interface(), reflect.Zero(fv.Type()).Interface()) {
-				return fmt.Errorf("field '%s' is required", field.Name)
-			}
-		}
-	}
-	return nil
-}
-
-// BindJSON decodifica y valida un JSON en un struct, luego invoca el handler con el objeto.
-func BindJSON[T any](handler func(http.ResponseWriter, *http.Request, Params, *T)) HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request, p Params) {
+// BindJSON decodifica JSON en struct T antes de llamar al handler.
+func BindJSON[T any](h func(http.ResponseWriter, *http.Request, Params, T)) HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request, p Params) {
 		var obj T
-		if err := json.NewDecoder(req.Body).Decode(&obj); err != nil {
-			http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&obj); err != nil {
+			http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
 			return
 		}
-		if err := validateStruct(&obj); err != nil {
-			http.Error(w, fmt.Sprintf("Validation error: %v", err), http.StatusBadRequest)
-			return
-		}
-		handler(w, req, p, &obj)
+		h(w, r, p, obj)
 	}
 }
 
-// BindXML decodifica y valida un XML en un struct, luego invoca el handler con el objeto.
-func BindXML[T any](handler func(http.ResponseWriter, *http.Request, Params, *T)) HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request, p Params) {
+// BindXML decodifica XML en struct T antes de llamar al handler.
+func BindXML[T any](h func(http.ResponseWriter, *http.Request, Params, T)) HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request, p Params) {
 		var obj T
-		if err := xml.NewDecoder(req.Body).Decode(&obj); err != nil {
-			http.Error(w, fmt.Sprintf("Invalid XML: %v", err), http.StatusBadRequest)
+		dec := xml.NewDecoder(r.Body)
+		if err := dec.Decode(&obj); err != nil {
+			http.Error(w, fmt.Sprintf("invalid XML: %v", err), http.StatusBadRequest)
 			return
 		}
-		if err := validateStruct(&obj); err != nil {
-			http.Error(w, fmt.Sprintf("Validation error: %v", err), http.StatusBadRequest)
-			return
-		}
-		handler(w, req, p, &obj)
+		h(w, r, p, obj)
 	}
 }
 
@@ -440,7 +417,7 @@ func (r *MoraRouter) Name(name, pattern string) {
 // URL genera la URL de la ruta nombrada con los parámetros dados.
 func (r *MoraRouter) URL(name string, params ...string) (string, error) {
 	pattern, ok := r.namedRoutes[name]
-	if (!ok) {
+	if !ok {
 		return "", fmt.Errorf("ruta no encontrada: %s", name)
 	}
 	segs := splitPath(pattern)
