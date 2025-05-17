@@ -354,7 +354,7 @@ func recoveryMiddleware(next HandlerFunc) HandlerFunc {
 				// Formatear y registrar el error
 				errMsg := fmt.Sprintf("[Mora][Recovery] panic en %s %s: %v\n%s",
 					r.Method, r.URL.Path, err, stackTrace)
-				log.Printf(errMsg)
+				log.Printf("%s", errMsg)
 
 				// En modo de desarrollo, podríamos devolver el stack trace
 				// (Se podría añadir una opción para configurar esto)
@@ -497,7 +497,7 @@ func WithMetrics() Option {
 		r.middlewares = append(r.middlewares, m)
 		// endpoint
 		r.Get("/metrics", func(w http.ResponseWriter, req *http.Request, p Params) {
-			metricsHandler(w, req)
+			metricsHandler(w)
 		})
 	}
 }
@@ -518,7 +518,7 @@ func metricsMiddleware(next HandlerFunc) HandlerFunc {
 	}
 }
 
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
+func metricsHandler(w http.ResponseWriter) {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
 	total := time.Duration(0)
