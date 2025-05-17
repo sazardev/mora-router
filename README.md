@@ -409,7 +409,7 @@ r := router.New(
 
 ## 🌟 Ejemplo completo
 
-Revisa el directorio `examples/simple-api` para ver una API completa implementada con MoraRouter.
+Revisa el directorio `examples/resource-demo` para ver una API completa implementada con MoraRouter.
 
 ## 📚 Documentación completa
 
