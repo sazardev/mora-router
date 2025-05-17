@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Mora Router Resource Demo</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+    <h1>Mora Router Resource Demo</h1>
+    <p>This is a demonstration of the Resource functionality in Mora Router.</p>
+
+    <h2>Available Endpoints</h2>
+    <table>
+        <tr>
+            <th>Method</th>
+            <th>URL</th>
+            <th>Action</th>
+            <th>Description</th>
+        </tr>
+        <tr>
+            <td><span class="method get">GET</span></td>
+            <td>{{.BasePath}}</td>
+            <td>Index</td>
+            <td>List all users</td>
+        </tr>
+        <tr>
+            <td><span class="method get">GET</span></td>
+            <td>{{.BasePath}}/:id</td>
+            <td>Show</td>
+            <td>Get a single user by ID</td>
+        </tr>
+        <tr>
+            <td><span class="method post">POST</span></td>
+            <td>{{.BasePath}}</td>
+            <td>Create</td>
+            <td>Create a new user</td>
+        </tr>
+        <tr>
+            <td><span class="method put">PUT</span></td>
+            <td>{{.BasePath}}/:id</td>
+            <td>Update</td>
+            <td>Update an existing user</td>
+        </tr>
+        <tr>
+            <td><span class="method delete">DELETE</span></td>
+            <td>{{.BasePath}}/:id</td>
+            <td>Delete</td>
+            <td>Delete a user</td>
+        </tr>
+    </table>
+
+    <h2>Example Usage</h2>
+
+    <h3>List all users</h3>
+    <pre>GET {{.BasePath}}</pre>
+
+    <h3>Get a specific user</h3>
+    <pre>GET {{.BasePath}}/1</pre>
+
+    <h3>Create a new user</h3>
+    <pre>
+POST {{.BasePath}}
+Content-Type: application/json
+
+{
+  "name": "John Doe",
+  "email": "john@example.com"
+}</pre>
+
+    <h3>Update a user</h3>
+    <pre>
+PUT {{.BasePath}}/1
+Content-Type: application/json
+
+{
+  "name": "Jane Doe",
+  "email": "jane@example.com"
+}</pre>
+
+    <h3>Delete a user</h3>
+    <pre>DELETE {{.BasePath}}/1</pre>
+
+    <h2>Try it out</h2>
+    <p>You can explore this API in the browser or using tools like curl, Postman, etc.</p>
+    <p>For a debugging interface, check out <a href="/_mora/debug">the debug panel</a>.</p>
+
+    {{if .Users}}
+    <h2>Current Users</h2>
+    <table>
+        <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Email</th>
+        </tr>
+        {{range .Users}}
+        <tr>
+            <td>{{.ID}}</td>
+            <td>{{.Name}}</td>
+            <td>{{.Email}}</td>
+        </tr>
+        {{end}}
+    </table>
+    {{end}}
+</body>
+
+</html>

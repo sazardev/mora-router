@@ -20,10 +20,11 @@ type Responder interface {
 // Render facilita el renderizado de respuestas en diferentes formatos.
 type Render struct {
 	// Opciones comunes
-	IndentJSON     bool
-	HTMLTemplates  *template.Template
-	TemplateDir    string
-	DefaultCharset string
+	IndentJSON      bool
+	HTMLTemplates   *template.Template
+	TemplateDir     string
+	DefaultCharset  string
+	TemplateManager *TemplateManager
 }
 
 // NewRender crea un nuevo renderizador con opciones por defecto.
@@ -63,6 +64,21 @@ func (r *Render) XML(w http.ResponseWriter, status int, v interface{}) {
 
 // HTML renderiza una plantilla HTML.
 func (r *Render) HTML(w http.ResponseWriter, status int, name string, data interface{}) {
+	// If we have a TemplateManager, use it
+	if r.TemplateManager != nil {
+		r.TemplateManager.Render(w, status, name, data)
+		return
+	}
+
+	// If we get a request context, try to get TemplateManager from it
+	if req, ok := w.(interface{ Request() *http.Request }); ok {
+		if tm := GetTemplateManager(req.Request()); tm != nil {
+			tm.Render(w, status, name, data)
+			return
+		}
+	}
+
+	// Legacy fallback using standard template loading
 	w.Header().Set("Content-Type", fmt.Sprintf("text/html; charset=%s", r.DefaultCharset))
 	w.WriteHeader(status)
 

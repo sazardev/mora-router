@@ -216,150 +216,34 @@ func main() {
 	userController := &UserController{
 		store: userStore,
 	}
-
 	// Create the router with some useful middleware
 	r := router.New(
 		router.WithLogging(),
 		router.WithRecovery(),
 		router.WithCORS("*"),
 		router.WithDebug(),
+		router.WithStaticFiles("/static", "templates"),
 	)
 
 	// Register the user resource
 	r.Resource("/api/users", userController)
 
+	// Set up templates with our new helper
+	router.WithTemplates("templates")(r)
+
 	// Add a simple home page that explains how to use the API
 	r.Get("/", func(w http.ResponseWriter, req *http.Request, p router.Params) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		html := `
-		<!DOCTYPE html>
-		<html>
-		<head>
-			<title>Mora Router Resource Demo</title>
-			<style>
-				body { 
-					font-family: Arial, sans-serif; 
-					max-width: 800px; 
-					margin: 0 auto; 
-					padding: 20px; 
-					line-height: 1.6;
-				}
-				h1 { color: #333; }
-				h2 { color: #555; margin-top: 30px; }
-				code { 
-					background: #f4f4f4; 
-					padding: 2px 5px; 
-					border-radius: 3px;
-				}
-				pre {
-					background: #f4f4f4;
-					padding: 10px;
-					border-radius: 5px;
-					overflow: auto;
-				}
-				table {
-					border-collapse: collapse;
-					width: 100%;
-				}
-				th, td {
-					border: 1px solid #ddd;
-					padding: 8px;
-					text-align: left;
-				}
-				th {
-					background-color: #f2f2f2;
-				}
-				.method {
-					font-weight: bold;
-				}
-				.get { color: #2c88d9; }
-				.post { color: #27ae60; }
-				.put { color: #f39c12; }
-				.delete { color: #e74c3c; }
-			</style>
-		</head>
-		<body>
-			<h1>Mora Router Resource Demo</h1>
-			<p>This is a demonstration of the Resource functionality in Mora Router.</p>
-			
-			<h2>Available Endpoints</h2>
-			<table>
-				<tr>
-					<th>Method</th>
-					<th>URL</th>
-					<th>Action</th>
-					<th>Description</th>
-				</tr>
-				<tr>
-					<td><span class="method get">GET</span></td>
-					<td>/api/users</td>
-					<td>Index</td>
-					<td>List all users</td>
-				</tr>
-				<tr>
-					<td><span class="method get">GET</span></td>
-					<td>/api/users/:id</td>
-					<td>Show</td>
-					<td>Get a single user by ID</td>
-				</tr>
-				<tr>
-					<td><span class="method post">POST</span></td>
-					<td>/api/users</td>
-					<td>Create</td>
-					<td>Create a new user</td>
-				</tr>
-				<tr>
-					<td><span class="method put">PUT</span></td>
-					<td>/api/users/:id</td>
-					<td>Update</td>
-					<td>Update an existing user</td>
-				</tr>
-				<tr>
-					<td><span class="method delete">DELETE</span></td>
-					<td>/api/users/:id</td>
-					<td>Delete</td>
-					<td>Delete a user</td>
-				</tr>
-			</table>
+		// Get current users for display
+		users := userStore.GetUsers()
 
-			<h2>Example Usage</h2>
-			
-			<h3>List all users</h3>
-			<pre>GET /api/users</pre>
-			
-			<h3>Get a specific user</h3>
-			<pre>GET /api/users/1</pre>
-			
-			<h3>Create a new user</h3>
-			<pre>
-POST /api/users
-Content-Type: application/json
+		// Setup template data (CSS is automatically loaded from templates/style.css)
+		data := map[string]interface{}{
+			"BasePath": "/api/users",
+			"Users":    users,
+		}
 
-{
-  "name": "John Doe",
-  "email": "john@example.com"
-}</pre>
-			
-			<h3>Update a user</h3>
-			<pre>
-PUT /api/users/1
-Content-Type: application/json
-
-{
-  "name": "Jane Doe",
-  "email": "jane@example.com"
-}</pre>
-			
-			<h3>Delete a user</h3>
-			<pre>DELETE /api/users/1</pre>
-			
-			<h2>Try it out</h2>
-			<p>You can explore this API in the browser or using tools like curl, Postman, etc.</p>
-			<p>For a debugging interface, check out <a href="/_mora/debug">the debug panel</a>.</p>
-		</body>
-		</html>
-		`
-		fmt.Fprint(w, html)
+		// Use our new helper function to render templates
+		router.RenderTemplate(w, req, "index.html", data)
 	})
 
 	// Start the server
