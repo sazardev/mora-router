@@ -35,7 +35,7 @@ func NewUserStore() *UserStore {
 	}
 
 	// Add some initial users
-	store.AddUser(User{Name: "Alice", Email: "alice@example.com"})
+	store.AddUser(User{Name: "Omar", Email: "omar@example.com"})
 	store.AddUser(User{Name: "Bob", Email: "bob@example.com"})
 	store.AddUser(User{Name: "Charlie", Email: "charlie@example.com"})
 
