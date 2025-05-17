@@ -13,9 +13,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
-	"strconv"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -265,10 +264,20 @@ func matchSegments(segs []segment, pathSegs []string, params Params) bool {
 	for i, seg := range segs {
 		if seg.wildcard {
 			if params != nil {
-				params[seg.name] = strings.Join(pathSegs[i:], "/")
+				if seg.name != "" {
+					params[seg.name] = strings.Join(pathSegs[i:], "/")
+				} else {
+					params["*"] = strings.Join(pathSegs[i:], "/")
+				}
 			}
 			return true
 		}
+
+		// Si no hay suficientes segmentos de ruta, no coincide
+		if i >= len(pathSegs) {
+			return false
+		}
+
 		val := pathSegs[i]
 		if seg.name != "" {
 			if seg.regex != nil && !seg.regex.MatchString(val) {
@@ -300,21 +309,64 @@ func applyMiddlewares(h HandlerFunc, mws []Middleware) HandlerFunc {
 	return wrapped
 }
 
-// loggingMiddleware registra método y ruta.
+// loggingMiddleware registra método, ruta, código de respuesta y tiempo de ejecución.
 func loggingMiddleware(next HandlerFunc) HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request, p Params) {
-		log.Printf("[Mora] %s %s", r.Method, r.URL.Path)
-		next(w, r, p)
+		start := time.Now()
+
+		// Wrappear el ResponseWriter para capturar el código de estado
+		rwBuffer := &responseBuffer{
+			ResponseWriter: w,
+			buf:            &bytes.Buffer{},
+			header:         w.Header(),
+			status:         http.StatusOK, // Default status
+		}
+
+		next(rwBuffer, r, p)
+
+		// Calcular duración y formatear el log
+		duration := time.Since(start)
+		var durationStr string
+
+		if duration < time.Millisecond {
+			durationStr = fmt.Sprintf("%.2fµs", float64(duration.Microseconds()))
+		} else if duration < time.Second {
+			durationStr = fmt.Sprintf("%.2fms", float64(duration.Milliseconds()))
+		} else {
+			durationStr = fmt.Sprintf("%.2fs", duration.Seconds())
+		}
+
+		// Log con formato más completo
+		log.Printf("[Mora] %s %s %d %s", r.Method, r.URL.Path, rwBuffer.status, durationStr)
 	}
 }
 
-// recoveryMiddleware captura panic y responde 500.
+// recoveryMiddleware captura panic y responde 500 con información detallada.
 func recoveryMiddleware(next HandlerFunc) HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request, p Params) {
 		defer func() {
 			if err := recover(); err != nil {
-				log.Printf("[Mora][Recovery] panic: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				// Capturar stack trace para debugging
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				stackTrace := string(buf[:n])
+
+				// Formatear y registrar el error
+				errMsg := fmt.Sprintf("[Mora][Recovery] panic en %s %s: %v\n%s",
+					r.Method, r.URL.Path, err, stackTrace)
+				log.Printf(errMsg)
+
+				// En modo de desarrollo, podríamos devolver el stack trace
+				// (Se podría añadir una opción para configurar esto)
+				isDev := os.Getenv("MORA_ENV") == "development"
+
+				w.WriteHeader(http.StatusInternalServerError)
+				if isDev {
+					w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+					fmt.Fprintf(w, "Internal Server Error: %v\n\n%s", err, stackTrace)
+				} else {
+					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				}
 			}
 		}()
 		next(w, r, p)
@@ -379,41 +431,11 @@ func BindXML[T any](h func(http.ResponseWriter, *http.Request, Params, T)) Handl
 }
 
 // validate inspecciona tags `validate` en campos de structs y aplica reglas básicas.
+// Usa el nuevo sistema de validación para validar structs.
 func validate(obj any) error {
-	v := reflect.ValueOf(obj)
-	if v.Kind() == reflect.Ptr {
-		v = v.Elem()
-	}
-	t := v.Type()
-	for i := 0; i < v.NumField(); i++ {
-		field := t.Field(i)
-		tag := field.Tag.Get("validate")
-		if tag == "" {
-			continue
-		}
-		parts := strings.Split(tag, ",")
-		fval := v.Field(i)
-		for _, rule := range parts {
-			switch {
-			case rule == "required":
-				zero := reflect.Zero(fval.Type()).Interface()
-				if reflect.DeepEqual(fval.Interface(), zero) {
-					return fmt.Errorf("%s is required", field.Name)
-				}
-			case strings.HasPrefix(rule, "min="):
-				min, _ := strconv.Atoi(strings.TrimPrefix(rule, "min="))
-				switch fval.Kind() {
-				case reflect.String:
-					if len(fval.String()) < min {
-						return fmt.Errorf("%s length must be >= %d", field.Name, min)
-					}
-				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-					if fval.Int() < int64(min) {
-						return fmt.Errorf("%s must be >= %d", field.Name, min)
-					}
-				}
-			}
-		}
+	errors := ValidateStruct(obj)
+	if len(errors) > 0 {
+		return errors
 	}
 	return nil
 }
@@ -619,18 +641,8 @@ func FileDownload(w http.ResponseWriter, r *http.Request, filePath string) {
 // WithHotReload habilita recarga automática de rutas al detectar cambios en el archivo dado.
 func WithHotReload(filePath string, interval time.Duration) Option {
 	return func(r *MoraRouter) {
-		go func() {
-			var lastMod time.Time
-			for {
-				if fi, err := os.Stat(filePath); err == nil {
-					if fi.ModTime().After(lastMod) {
-						lastMod = fi.ModTime()
-						// TODO: invocar lógica de recarga (p.ej. r.reloadRoutes())
-					}
-				}
-				time.Sleep(interval)
-			}
-		}()
+		// Usar la implementación completa desde hot_reload.go
+		CompleteHotReload(r, filePath, interval)
 	}
 }
 
