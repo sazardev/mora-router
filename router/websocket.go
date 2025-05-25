@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bufio"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -24,6 +26,10 @@ type WebSocketConnection struct {
 	Send        chan []byte
 	isConnected bool
 	closeMutex  sync.Mutex
+
+	// Hijacked connection components
+	netConn net.Conn
+	bufrw   *bufio.ReadWriter
 }
 
 // SendText sends a text message to the client
@@ -32,7 +38,7 @@ func (c *WebSocketConnection) SendText(msg string) error {
 		return fmt.Errorf("connection closed")
 	}
 	frame := newTextFrame([]byte(msg))
-	_, err := c.Conn.Write(frame)
+	_, err := c.netConn.Write(frame)
 	return err
 }
 
@@ -51,7 +57,7 @@ func (c *WebSocketConnection) SendBinary(data []byte) error {
 		return fmt.Errorf("connection closed")
 	}
 	frame := newBinaryFrame(data)
-	_, err := c.Conn.Write(frame)
+	_, err := c.netConn.Write(frame)
 	return err
 }
 
@@ -66,7 +72,10 @@ func (c *WebSocketConnection) Close() {
 
 	// Send close frame
 	closeFrame := []byte{0x88, 0x02, 0x03, 0xE8} // Normal closure (1000)
-	c.Conn.Write(closeFrame)
+	if c.netConn != nil {
+		c.netConn.Write(closeFrame)
+		c.netConn.Close()
+	}
 	c.isConnected = false
 
 	// Remove from hub if present
@@ -195,11 +204,22 @@ func WebSocketHandler(config WebSocketConfig) HandlerFunc {
 		if !isWebSocketUpgrade(r) {
 			http.Error(w, "Expected WebSocket Upgrade", http.StatusBadRequest)
 			return
+		} // Get the underlying connection using hijack before doing the handshake
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "WebSocket error: connection doesn't support hijacking", http.StatusInternalServerError)
+			return
 		}
 
-		// Perform handshake
-		if !performHandshake(w, r) {
-			http.Error(w, "WebSocket handshake failed", http.StatusBadRequest)
+		netConn, bufrw, err := hijacker.Hijack()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("WebSocket hijack failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Perform handshake by writing directly to the hijacked connection
+		if err := writeHandshake(netConn, r); err != nil {
+			netConn.Close()
 			return
 		}
 
@@ -210,12 +230,15 @@ func WebSocketHandler(config WebSocketConfig) HandlerFunc {
 			Hub:         hub,
 			Send:        make(chan []byte, 256),
 			isConnected: true,
+			netConn:     netConn,
+			bufrw:       bufrw,
 		}
 
 		hub.Register <- conn
 
-		// Start handling the connection
-		go handleWebSocketConnection(conn, config)
+		// Handle the connection in the current goroutine - no need for 'go' here
+		// since we already hijacked the connection
+		handleWebSocketConnection(conn, config)
 	}
 }
 
@@ -225,7 +248,7 @@ func isWebSocketUpgrade(r *http.Request) bool {
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
-// performHandshake completes the WebSocket opening handshake
+// performHandshake completes the WebSocket opening handshake (deprecated, use writeHandshake instead)
 func performHandshake(w http.ResponseWriter, r *http.Request) bool {
 	// Get the WebSocket key
 	key := r.Header.Get("Sec-WebSocket-Key")
@@ -250,30 +273,44 @@ func performHandshake(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// handleWebSocketConnection reads frames and dispatches them
-func handleWebSocketConnection(conn *WebSocketConnection, config WebSocketConfig) {
-	hijacker, ok := conn.Conn.(http.Hijacker)
-	if !ok {
-		log.Println("WebSocket error: connection doesn't support hijacking")
-		return
+// writeHandshake writes the WebSocket handshake directly to the connection
+func writeHandshake(conn net.Conn, r *http.Request) error {
+	// Get the WebSocket key
+	key := r.Header.Get("Sec-WebSocket-Key")
+	if key == "" {
+		return fmt.Errorf("missing Sec-WebSocket-Key header")
 	}
 
-	netConn, bufrw, err := hijacker.Hijack()
-	if err != nil {
-		log.Printf("WebSocket hijack failed: %v", err)
-		return
-	}
-	defer netConn.Close()
+	// Calculate accept key (per RFC6455)
+	h := sha1.New()
+	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	acceptKey := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	// Write handshake response directly to the connection
+	handshake := fmt.Sprintf(
+		"HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: %s\r\n\r\n",
+		acceptKey,
+	)
+
+	_, err := conn.Write([]byte(handshake))
+	return err
+}
+
+// handleWebSocketConnection reads frames and dispatches them
+func handleWebSocketConnection(conn *WebSocketConnection, config WebSocketConfig) {
+	defer conn.netConn.Close()
 
 	// Set deadlines
 	readDeadline := time.Now().Add(config.PingInterval + 10*time.Second)
-	netConn.SetReadDeadline(readDeadline)
-
+	conn.netConn.SetReadDeadline(readDeadline)
 	// Read loop
 	for {
 		// Read frame header
 		frameHeader := make([]byte, 2)
-		if _, err := io.ReadFull(bufrw, frameHeader); err != nil {
+		if _, err := io.ReadFull(conn.bufrw, frameHeader); err != nil {
 			break
 		}
 
@@ -286,13 +323,13 @@ func handleWebSocketConnection(conn *WebSocketConnection, config WebSocketConfig
 		// Handle extended payload length
 		if payloadLen == 126 {
 			extLen := make([]byte, 2)
-			if _, err := io.ReadFull(bufrw, extLen); err != nil {
+			if _, err := io.ReadFull(conn.bufrw, extLen); err != nil {
 				break
 			}
 			payloadLen = int(binary.BigEndian.Uint16(extLen))
 		} else if payloadLen == 127 {
 			extLen := make([]byte, 8)
-			if _, err := io.ReadFull(bufrw, extLen); err != nil {
+			if _, err := io.ReadFull(conn.bufrw, extLen); err != nil {
 				break
 			}
 			payloadLen = int(binary.BigEndian.Uint64(extLen))
@@ -309,14 +346,14 @@ func handleWebSocketConnection(conn *WebSocketConnection, config WebSocketConfig
 		var maskKey []byte
 		if masked {
 			maskKey = make([]byte, 4)
-			if _, err := io.ReadFull(bufrw, maskKey); err != nil {
+			if _, err := io.ReadFull(conn.bufrw, maskKey); err != nil {
 				break
 			}
 		}
 
 		// Read payload
 		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(bufrw, payload); err != nil {
+		if _, err := io.ReadFull(conn.bufrw, payload); err != nil {
 			break
 		}
 
@@ -345,10 +382,10 @@ func handleWebSocketConnection(conn *WebSocketConnection, config WebSocketConfig
 
 		case 0x9: // Ping frame, respond with pong
 			pongFrame := newPongFrame(payload)
-			netConn.Write(pongFrame)
+			conn.netConn.Write(pongFrame)
 
 		case 0xA: // Pong frame, reset deadline
-			netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
+			conn.netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
 		}
 
 		if !fin {
