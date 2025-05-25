@@ -17,7 +17,7 @@ func main() {
 		return
 	}
 	// Create router with WebSocket support
-	r := router.New(router.WithGorillaWebSocket())
+	r := router.New(router.WithGorillaWebSocket(), router.WithLogging())
 
 	// Basic WebSocket endpoint - echo server
 	r.WebSocket("/ws", func(conn *router.WebSocketConnection, msg []byte) {

@@ -44,9 +44,7 @@ func runHubExample() {
 			// Notify all clients about user disconnection
 			userID := conn.ID[len(conn.ID)-4:]
 			conn.Hub.BroadcastMessage([]byte(fmt.Sprintf("🔴 Usuario %s se ha desconectado", userID)))
-		},
-	}
-
+		}}
 	// Add the WebSocket handler with the shared config
 	r.Get("/hub", router.WebSocketHandler(sharedConfig))
 

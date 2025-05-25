@@ -16,6 +16,12 @@ import (
 	"time"
 )
 
+// Global variables for hub management
+var (
+	hubsMu sync.Mutex
+	hubs   = make(map[string]*WebSocketHub)
+)
+
 // WebSocketConnection represents a client connection
 type WebSocketConnection struct {
 	// Standard websocket connection
@@ -122,25 +128,43 @@ func (h *WebSocketHub) Run() {
 	for {
 		select {
 		case conn := <-h.Register:
+			// Add the connection to our map
 			h.Connections[conn] = true
+			log.Printf("Hub: registered connection %s, total: %d", conn.ID, len(h.Connections))
+			// Call the OnConnect handler if provided
 			if h.Config.OnConnect != nil {
 				h.Config.OnConnect(conn)
 			}
 
 		case conn := <-h.Unregister:
+			// Remove the connection from our map if it exists
 			if _, ok := h.Connections[conn]; ok {
+				log.Printf("Hub: unregistered connection %s, remaining: %d", conn.ID, len(h.Connections)-1)
 				delete(h.Connections, conn)
 				close(conn.Send)
+				// Call the OnDisconnect handler if provided
 				if h.Config.OnDisconnect != nil {
 					h.Config.OnDisconnect(conn)
 				}
 			}
 
 		case msg := <-h.Broadcast:
+			// Debug logs
+			log.Printf("Hub: broadcasting message to %d connections: %s", len(h.Connections), string(msg))
+			// Send the message to all connected clients
 			for conn := range h.Connections {
+				if !conn.isConnected {
+					// Skip disconnected clients
+					continue
+				}
+
+				// Try to send, but don't block if client is slow
 				select {
 				case conn.Send <- msg:
+					// Message sent to client's send channel
 				default:
+					// Client's buffer is full, likely stuck or slow
+					log.Printf("Hub: failed to send to connection %s, removing", conn.ID)
 					close(conn.Send)
 					delete(h.Connections, conn)
 				}
@@ -180,8 +204,17 @@ func WebSocketHandler(config WebSocketConfig) HandlerFunc {
 		config.PingInterval = 30 * time.Second
 	}
 
-	hub := NewWebSocketHub("", config)
-	go hub.Run()
+	// Create a shared hub for all connections to this endpoint
+	// Use a static map to store hubs by path
+	hubKey := config.Path
+	hubsMu.Lock()
+	hub, exists := hubs[hubKey]
+	if !exists {
+		hub = NewWebSocketHub("", config)
+		hubs[hubKey] = hub
+		go hub.Run()
+	}
+	hubsMu.Unlock()
 
 	return func(w http.ResponseWriter, r *http.Request, params Params) {
 		// Check origin if configured
@@ -301,11 +334,78 @@ func writeHandshake(conn net.Conn, r *http.Request) error {
 
 // handleWebSocketConnection reads frames and dispatches them
 func handleWebSocketConnection(conn *WebSocketConnection, config WebSocketConfig) {
-	defer conn.netConn.Close()
+	defer func() {
+		// When this function returns, the connection is closed
+		conn.netConn.Close()
+		// Ensure we unregister from the hub
+		if conn.Hub != nil && conn.isConnected {
+			conn.Hub.Unregister <- conn
+		}
+	}()
 
-	// Set deadlines
-	readDeadline := time.Now().Add(config.PingInterval + 10*time.Second)
-	conn.netConn.SetReadDeadline(readDeadline)
+	// Set initial read deadline
+	conn.netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
+
+	// Send ping frames periodically to keep connection alive
+	pingTicker := time.NewTicker(config.PingInterval)
+	defer pingTicker.Stop()
+
+	// Start a goroutine to process the Send channel
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			close(done)
+		}()
+
+		for {
+			select {
+			case message, ok := <-conn.Send:
+				if !ok {
+					// Send channel was closed
+					return
+				}
+
+				if !conn.isConnected {
+					return
+				}
+
+				frame := newTextFrame(message)
+				// Set a write deadline to prevent blocked connections
+				conn.netConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if _, err := conn.netConn.Write(frame); err != nil {
+					// If we can't write to the connection, it's likely dead
+					conn.isConnected = false
+					// Don't use Unregister here to avoid race conditions
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Start a goroutine to send periodic pings
+	go func() {
+		for {
+			select {
+			case <-pingTicker.C:
+				if !conn.isConnected {
+					return
+				}
+				// Send a ping frame
+				pingFrame := newPingFrame([]byte{})
+				conn.netConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if _, err := conn.netConn.Write(pingFrame); err != nil {
+					// Connection is dead
+					conn.isConnected = false
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
 	// Read loop
 	for {
 		// Read frame header
@@ -370,11 +470,15 @@ func handleWebSocketConnection(conn *WebSocketConnection, config WebSocketConfig
 			if config.MessageHandler != nil {
 				config.MessageHandler(conn, payload)
 			}
+			// Reset read deadline after processing message
+			conn.netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
 
 		case 0x2: // Binary frame
 			if config.MessageHandler != nil {
 				config.MessageHandler(conn, payload)
 			}
+			// Reset read deadline after processing message
+			conn.netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
 
 		case 0x8: // Close frame
 			conn.Close()
@@ -383,6 +487,8 @@ func handleWebSocketConnection(conn *WebSocketConnection, config WebSocketConfig
 		case 0x9: // Ping frame, respond with pong
 			pongFrame := newPongFrame(payload)
 			conn.netConn.Write(pongFrame)
+			// Reset read deadline after processing ping
+			conn.netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
 
 		case 0xA: // Pong frame, reset deadline
 			conn.netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
