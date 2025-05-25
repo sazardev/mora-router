@@ -4,28 +4,36 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/sazardev/mora-router/router"
 )
 
 func runHubExample() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+	log.Println("Starting Hub Example...")
+
 	// Create router with WebSocket support
 	r := router.New(router.WithGorillaWebSocket())
 
-	// Create a shared WebSocket config with the hub
-	sharedConfig := router.WebSocketConfig{
+	// Create a WebSocket config with handlers for the hub
+	hubConfig := router.WebSocketConfig{
 		Path:           "/hub",
 		MaxMessageSize: 1024 * 64,
 		PingInterval:   30 * time.Second,
 		MessageHandler: func(conn *router.WebSocketConnection, msg []byte) {
 			// Log the message
-			log.Printf("Received message from %s: %s", conn.ID, string(msg))
+			log.Printf("Hub received message from %s: %s", conn.ID, string(msg))
 
 			// Format the message with sender ID
 			formattedMsg := fmt.Sprintf("User %s: %s", conn.ID[len(conn.ID)-4:], string(msg))
 
+			// Immediately echo back to sender for confirmation
+			conn.SendText(fmt.Sprintf("Message sent: %s", string(msg)))
+
 			// Broadcast formatted message to all clients
+			log.Printf("Broadcasting message to hub: %s", formattedMsg)
 			conn.Hub.BroadcastMessage([]byte(formattedMsg))
 		},
 		OnConnect: func(conn *router.WebSocketConnection) {
@@ -44,9 +52,25 @@ func runHubExample() {
 			// Notify all clients about user disconnection
 			userID := conn.ID[len(conn.ID)-4:]
 			conn.Hub.BroadcastMessage([]byte(fmt.Sprintf("🔴 Usuario %s se ha desconectado", userID)))
-		}}
-	// Add the WebSocket handler with the shared config
-	r.Get("/hub", router.WebSocketHandler(sharedConfig))
+		},
+	}
+
+	// Register the WebSocket handler with the router
+	r.Get("/hub", router.WebSocketHandler(hubConfig))
+	// Setup connection handlers using middleware
+	r.Use(func(next router.HandlerFunc) router.HandlerFunc {
+		return func(w http.ResponseWriter, req *http.Request, params router.Params) {
+			// Only apply to WebSocket requests
+			if strings.HasPrefix(req.URL.Path, "/hub") && strings.ToLower(req.Header.Get("Upgrade")) == "websocket" {
+				log.Printf("WebSocket middleware: new connection attempt to %s", req.URL.Path)
+			}
+			next(w, req, params)
+		}
+	})
+	// Add simple ping endpoint for testing
+	r.Get("/ping", func(w http.ResponseWriter, r *http.Request, p router.Params) {
+		w.Write([]byte("pong"))
+	})
 
 	// Serve a simple HTML demo page
 	r.Get("/hub-demo", func(w http.ResponseWriter, r *http.Request, p router.Params) {
@@ -89,13 +113,15 @@ func runHubExample() {
             <button onclick="sendHubMessage()">Enviar</button>
         </div>
     </div>
-    
-    <script>
+      <script>
+        console.log("Initializing WebSocket connection...");
+        
         // Hub WebSocket
         const hubWs = new WebSocket('ws://' + location.host + '/hub');
         let reconnectAttempts = 0;
         
-        hubWs.onopen = function() {
+        hubWs.onopen = function(event) {
+            console.log("WebSocket connection opened:", event);
             document.getElementById('connection-status').className = 'status online';
             document.getElementById('connection-status').textContent = 'Conectado';
             logHub('Conectado al servidor de chat', true);
@@ -103,6 +129,7 @@ func runHubExample() {
         };
         
         hubWs.onmessage = function(e) {
+            console.log("WebSocket message received:", e.data);
             // Check if it's a system message
             const isSystem = e.data.startsWith('🟢') || e.data.startsWith('🔴') || e.data.startsWith('¡Bienvenido');
             logHub(e.data, isSystem);
@@ -123,12 +150,18 @@ func runHubExample() {
                     window.hubWs = new WebSocket('ws://' + location.host + '/hub');
                 }, timeout);
             }, 1000);
-        };
-          function sendHubMessage() {
+        };        function sendHubMessage() {
             const msg = document.getElementById('hub-message').value.trim();
             if (msg) {
-                hubWs.send(msg);
-                document.getElementById('hub-message').value = '';
+                console.log("Sending message:", msg);
+                try {
+                    hubWs.send(msg);
+                    logHub("Mensaje enviado: " + msg, true);
+                    document.getElementById('hub-message').value = '';
+                } catch (err) {
+                    console.error("Error sending message:", err);
+                    logHub("Error al enviar mensaje: " + err.message, true);
+                }
             }
         }
         

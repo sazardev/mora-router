@@ -43,8 +43,15 @@ func (c *WebSocketConnection) SendText(msg string) error {
 	if !c.isConnected {
 		return fmt.Errorf("connection closed")
 	}
+	log.Printf("Sending text to client %s: %s", c.ID, msg)
 	frame := newTextFrame([]byte(msg))
+
+	// Set write deadline to prevent blocked connections
+	c.netConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	_, err := c.netConn.Write(frame)
+	if err != nil {
+		log.Printf("ERROR: Failed to send message to client %s: %v", c.ID, err)
+	}
 	return err
 }
 
@@ -125,6 +132,7 @@ func NewWebSocketHub(room string, cfg WebSocketConfig) *WebSocketHub {
 
 // Run starts the hub's event loop
 func (h *WebSocketHub) Run() {
+	log.Printf("Starting WebSocket hub for room: %s", h.Room)
 	for {
 		select {
 		case conn := <-h.Register:
@@ -141,11 +149,12 @@ func (h *WebSocketHub) Run() {
 			if _, ok := h.Connections[conn]; ok {
 				log.Printf("Hub: unregistered connection %s, remaining: %d", conn.ID, len(h.Connections)-1)
 				delete(h.Connections, conn)
-				close(conn.Send)
 				// Call the OnDisconnect handler if provided
 				if h.Config.OnDisconnect != nil {
 					h.Config.OnDisconnect(conn)
 				}
+				// Close the send channel after calling OnDisconnect to avoid race conditions
+				close(conn.Send)
 			}
 
 		case msg := <-h.Broadcast:
@@ -155,6 +164,7 @@ func (h *WebSocketHub) Run() {
 			for conn := range h.Connections {
 				if !conn.isConnected {
 					// Skip disconnected clients
+					log.Printf("Hub: skipping disconnected client %s", conn.ID)
 					continue
 				}
 
@@ -162,6 +172,7 @@ func (h *WebSocketHub) Run() {
 				select {
 				case conn.Send <- msg:
 					// Message sent to client's send channel
+					log.Printf("Hub: sent message to client %s", conn.ID)
 				default:
 					// Client's buffer is full, likely stuck or slow
 					log.Printf("Hub: failed to send to connection %s, removing", conn.ID)
@@ -175,6 +186,7 @@ func (h *WebSocketHub) Run() {
 
 // Broadcast sends a message to all connected clients
 func (h *WebSocketHub) BroadcastMessage(msg []byte) {
+	log.Printf("Broadcasting message to hub (active connections: %d): %s", len(h.Connections), string(msg))
 	h.Broadcast <- msg
 }
 
@@ -203,16 +215,18 @@ func WebSocketHandler(config WebSocketConfig) HandlerFunc {
 	if config.PingInterval == 0 {
 		config.PingInterval = 30 * time.Second
 	}
-
 	// Create a shared hub for all connections to this endpoint
 	// Use a static map to store hubs by path
 	hubKey := config.Path
 	hubsMu.Lock()
 	hub, exists := hubs[hubKey]
 	if !exists {
+		log.Printf("Creating new WebSocket hub for path: %s", hubKey)
 		hub = NewWebSocketHub("", config)
 		hubs[hubKey] = hub
 		go hub.Run()
+	} else {
+		log.Printf("Using existing WebSocket hub for path: %s (connections: %d)", hubKey, len(hub.Connections))
 	}
 	hubsMu.Unlock()
 
@@ -255,11 +269,14 @@ func WebSocketHandler(config WebSocketConfig) HandlerFunc {
 			netConn.Close()
 			return
 		}
+		// Create connection ID with a more readable format
+		connID := fmt.Sprintf("%d", time.Now().UnixNano())
+		log.Printf("New WebSocket connection: %s (path: %s)", connID, config.Path)
 
 		conn := &WebSocketConnection{
 			Conn:        w,
 			Request:     r,
-			ID:          fmt.Sprintf("%d", time.Now().UnixNano()),
+			ID:          connID,
 			Hub:         hub,
 			Send:        make(chan []byte, 256),
 			isConnected: true,
@@ -267,7 +284,11 @@ func WebSocketHandler(config WebSocketConfig) HandlerFunc {
 			bufrw:       bufrw,
 		}
 
+		// Register this connection with the hub
 		hub.Register <- conn
+
+		// Debug output
+		log.Printf("Registered connection %s with hub. Calling handleWebSocketConnection", connID)
 
 		// Handle the connection in the current goroutine - no need for 'go' here
 		// since we already hijacked the connection
@@ -468,29 +489,38 @@ func handleWebSocketConnection(conn *WebSocketConnection, config WebSocketConfig
 		switch opcode {
 		case 0x1: // Text frame
 			if config.MessageHandler != nil {
+				log.Printf("Received text frame from client %s: %s", conn.ID, string(payload))
+				// Call the message handler
 				config.MessageHandler(conn, payload)
+			} else {
+				log.Printf("Warning: No message handler registered for connection %s", conn.ID)
 			}
 			// Reset read deadline after processing message
 			conn.netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
 
 		case 0x2: // Binary frame
 			if config.MessageHandler != nil {
+				log.Printf("Received binary frame from client %s: %d bytes", conn.ID, len(payload))
+				// Call the message handler
 				config.MessageHandler(conn, payload)
 			}
 			// Reset read deadline after processing message
 			conn.netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
 
 		case 0x8: // Close frame
+			log.Printf("Received close frame from client %s", conn.ID)
 			conn.Close()
 			return
 
 		case 0x9: // Ping frame, respond with pong
+			log.Printf("Received ping from client %s", conn.ID)
 			pongFrame := newPongFrame(payload)
 			conn.netConn.Write(pongFrame)
 			// Reset read deadline after processing ping
 			conn.netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
 
 		case 0xA: // Pong frame, reset deadline
+			log.Printf("Received pong from client %s", conn.ID)
 			conn.netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
 		}
 
@@ -676,6 +706,7 @@ func (r *MoraRouter) WebSocket(path string, handler func(*WebSocketConnection, [
 		PingInterval:   30 * time.Second,
 	}
 
+	log.Printf("Registering WebSocket handler for path: %s", path)
 	r.Get(path, WebSocketHandler(config))
 }
 
