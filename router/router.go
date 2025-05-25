@@ -684,13 +684,35 @@ func (r *MoraRouter) BuildOpenAPISpec() map[string]interface{} {
 		}
 		paths[rt.pattern][strings.ToLower(rt.method)] = map[string]interface{}{
 			"parameters": params,
-			"responses":  map[string]interface{}{"200": map[string]string{"description": "OK"}},
+			"responses": map[string]interface{}{
+				"200": map[string]interface{}{
+					"description": "Respuesta exitosa",
+					"content": map[string]interface{}{
+						"application/json": map[string]interface{}{
+							"schema": map[string]interface{}{
+								"type": "object",
+							},
+						},
+					},
+				},
+			},
 		}
 	}
+
+	// Versionar automáticamente la API
+	version := "1.0.0"
+
 	return map[string]interface{}{
 		"openapi": "3.0.0",
-		"info":    map[string]string{"title": "Mora API", "version": "1.0.0"},
-		"paths":   paths,
+		"info": map[string]interface{}{
+			"title":       "API generada con MoraRouter",
+			"description": "Documentación automática de la API",
+			"version":     version,
+		},
+		"paths": paths,
+		"components": map[string]interface{}{
+			"schemas": map[string]interface{}{},
+		},
 	}
 }
 
@@ -924,3 +946,57 @@ func (r *MoraRouter) UseMacro(prefix, macroName string, handler HandlerFunc) {
 		r.Name(base+"."+macro.name, path)
 	}
 }
+
+// With aplica middlewares temporalmente a las siguientes operaciones de ruta
+func (r *MoraRouter) With(middlewares ...Middleware) *MoraRouter {
+	// Crear un nuevo router temporal con los mismos datos
+	clone := &MoraRouter{
+		routes:             r.routes,
+		middlewares:        append([]Middleware{}, r.middlewares...),
+		notFound:           r.notFound,
+		namedRoutes:        r.namedRoutes,
+		mounts:             r.mounts,
+		middlewareRegistry: r.middlewareRegistry,
+		i18n:               r.i18n,
+	}
+
+	// Agregar los middlewares temporales
+	clone.middlewares = append(clone.middlewares, middlewares...)
+
+	return clone
+}
+
+// Use agrega middlewares a un grupo específico
+func (g *RouteGroup) Use(middlewares ...Middleware) *RouteGroup {
+	// Crear una copia del grupo
+	newGroup := &RouteGroup{
+		prefix: g.prefix,
+		router: &MoraRouter{
+			routes:             g.router.routes,
+			middlewares:        append([]Middleware{}, g.router.middlewares...),
+			notFound:           g.router.notFound,
+			namedRoutes:        g.router.namedRoutes,
+			mounts:             g.router.mounts,
+			middlewareRegistry: g.router.middlewareRegistry,
+			i18n:               g.router.i18n,
+		},
+	}
+
+	// Agregar middlewares
+	newGroup.router.middlewares = append(newGroup.router.middlewares, middlewares...)
+
+	return newGroup
+}
+
+// With aplica middlewares temporales a las siguientes operaciones de ruta en el grupo
+func (g *RouteGroup) With(middlewares ...Middleware) *RouteGroup {
+	// Crear una copia del grupo
+	newGroup := &RouteGroup{
+		prefix: g.prefix,
+		router: g.router.With(middlewares...),
+	}
+
+	return newGroup
+}
+
+// WebSocket handler is implemented in websocket.go

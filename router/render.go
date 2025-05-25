@@ -66,14 +66,22 @@ func (r *Render) XML(w http.ResponseWriter, status int, v interface{}) {
 func (r *Render) HTML(w http.ResponseWriter, status int, name string, data interface{}) {
 	// If we have a TemplateManager, use it
 	if r.TemplateManager != nil {
-		r.TemplateManager.Render(w, status, name, data)
+		w.Header().Set("Content-Type", fmt.Sprintf("text/html; charset=%s", r.DefaultCharset))
+		w.WriteHeader(status)
+		if err := r.TemplateManager.Render(w, name, data); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 
-	// If we get a request context, try to get TemplateManager from it
-	if req, ok := w.(interface{ Request() *http.Request }); ok {
-		if tm := GetTemplateManager(req.Request()); tm != nil {
-			tm.Render(w, status, name, data)
+	// If we have access to the router through the context
+	if req, ok := data.(interface{ GetRouter() *MoraRouter }); ok {
+		if router := req.GetRouter(); router != nil && router.templateManager != nil {
+			w.Header().Set("Content-Type", fmt.Sprintf("text/html; charset=%s", r.DefaultCharset))
+			w.WriteHeader(status)
+			if err := router.templateManager.Render(w, name, data); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
 	}

@@ -305,7 +305,8 @@ func (v *Validator) validateIn(value reflect.Value, allowedValues []string) bool
 // DefaultValidator es una instancia global del validador para uso conveniente.
 var DefaultValidator = NewValidator()
 
-// ValidateStruct valida un struct con el validador por defecto.
+// ValidateStruct valida un struct usando tags validate
 func ValidateStruct(obj interface{}) ValidationErrors {
-	return DefaultValidator.Validate(obj)
+	v := NewValidator()
+	return v.Validate(obj)
 }

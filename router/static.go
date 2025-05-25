@@ -22,8 +22,8 @@ type StaticOptions struct {
 	SetContentType bool
 }
 
-// WithStaticFiles adds middleware to serve static files from a directory
-func WithStaticFiles(urlPrefix, dir string) Option {
+// StaticFilesOption adds middleware to serve static files from a directory
+func StaticFilesOption(urlPrefix, dir string) Option {
 	return WithStaticFilesAdvanced(StaticOptions{
 		URLPrefix:      urlPrefix,
 		Directory:      dir,
@@ -34,6 +34,9 @@ func WithStaticFiles(urlPrefix, dir string) Option {
 		},
 	})
 }
+
+// WithStaticFiles is an alias to StaticFilesOption for backward compatibility
+var WithStaticFiles = StaticFilesOption
 
 // WithStaticFilesAdvanced adds middleware to serve static files with advanced options
 func WithStaticFilesAdvanced(options StaticOptions) Option {

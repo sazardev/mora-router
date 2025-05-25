@@ -24,6 +24,7 @@ type MoraRouter struct {
 	mounts             []mount
 	middlewareRegistry map[string]Middleware
 	i18n               map[string]map[string]string
+	templateManager    *TemplateManager
 }
 
 // Alias para compatibilidad

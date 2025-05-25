@@ -2,12 +2,13 @@ package router
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -19,376 +20,351 @@ type FormFile struct {
 	Content  []byte
 }
 
-// Form encapsula datos de un formulario para su procesamiento.
+// Form encapsula los datos de un formulario y sus posibles errores.
 type Form struct {
-	req           *http.Request
-	Values        map[string][]string
-	Files         map[string][]*FormFile
-	MaxFileSize   int64
-	AllowedTypes  []string
-	UploadDir     string
-	Errors        ValidationErrors
-	parsedForm    bool
-	parsedMulti   bool
-	ValidateEmpty bool
+	Values    map[string][]string
+	Files     map[string][]*FormFile
+	Errors    map[string]string
+	validated bool
 }
 
-// NewForm crea un form handler para una petición HTTP.
-func NewForm(r *http.Request) *Form {
-	return &Form{
-		req:           r,
-		Values:        make(map[string][]string),
-		Files:         make(map[string][]*FormFile),
-		MaxFileSize:   10 * 1024 * 1024, // 10MB por defecto
-		UploadDir:     os.TempDir(),
-		ValidateEmpty: false,
-	}
-}
-
-// Parse procesa todos los datos del formulario.
-func (f *Form) Parse() error {
-	if err := f.ParseForm(); err != nil {
-		return err
-	}
-	return f.ParseMultipart()
-}
-
-// ParseForm procesa los datos de formulario básicos.
-func (f *Form) ParseForm() error {
-	if f.parsedForm {
-		return nil
+// NewForm crea un nuevo Form desde una petición HTTP.
+func NewForm(r *http.Request, maxMemory int64) (*Form, error) {
+	if maxMemory <= 0 {
+		maxMemory = 32 << 20 // 32MB por defecto
 	}
 
-	if err := f.req.ParseForm(); err != nil {
-		return err
+	// Parsear formulario y archivos
+	if err := r.ParseMultipartForm(maxMemory); err != nil {
+		// Si no es multipart, intentar como form normal
+		if err != http.ErrNotMultipart {
+			// Intentar ParseForm para formularios normales
+			if err := r.ParseForm(); err != nil {
+				return nil, fmt.Errorf("error parsing form: %w", err)
+			}
+		}
 	}
 
-	f.Values = f.req.Form
-	f.parsedForm = true
-	return nil
-}
-
-// ParseMultipart procesa archivos y datos de formulario multipart.
-func (f *Form) ParseMultipart() error {
-	if f.parsedMulti {
-		return nil
+	form := &Form{
+		Values:    make(map[string][]string),
+		Files:     make(map[string][]*FormFile),
+		Errors:    make(map[string]string),
+		validated: false,
 	}
 
-	// Si no es multipart, no hay nada que hacer
-	contentType := f.req.Header.Get("Content-Type")
-	if !strings.Contains(contentType, "multipart/form-data") {
-		f.parsedMulti = true
-		return nil
+	// Copiar valores del formulario
+	if r.PostForm != nil {
+		for k, v := range r.PostForm {
+			form.Values[k] = append(form.Values[k], v...)
+		}
+	}
+	if r.Form != nil {
+		for k, v := range r.Form {
+			if _, exists := form.Values[k]; !exists {
+				form.Values[k] = append(form.Values[k], v...)
+			}
+		}
 	}
 
-	// Parsear con maxMemory como límite
-	if err := f.req.ParseMultipartForm(f.MaxFileSize); err != nil {
-		return err
-	}
-
-	// Procesar archivos
-	if f.req.MultipartForm != nil && f.req.MultipartForm.File != nil {
-		for field, files := range f.req.MultipartForm.File {
-			formFiles := make([]*FormFile, 0, len(files))
-
-			for _, fileHeader := range files {
-				// Comprobar extensión si hay filtros
-				if len(f.AllowedTypes) > 0 {
-					ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
-					allowed := false
-					for _, allowedType := range f.AllowedTypes {
-						if ext == allowedType || "."+strings.ToLower(allowedType) == ext {
-							allowed = true
-							break
-						}
-					}
-					if !allowed {
-						return fmt.Errorf("tipo de archivo no permitido: %s", ext)
-					}
-				}
-
-				// Abrir el archivo
-				file, err := fileHeader.Open()
+	// Procesar archivos si es multipart
+	if r.MultipartForm != nil && r.MultipartForm.File != nil {
+		for field, fileHeaders := range r.MultipartForm.File {
+			for _, header := range fileHeaders {
+				file, err := header.Open()
 				if err != nil {
-					return err
-				}
-				defer file.Close()
-
-				// Leer el contenido
-				content := make([]byte, fileHeader.Size)
-				if _, err := file.Read(content); err != nil {
-					return err
+					return nil, fmt.Errorf("error opening uploaded file: %w", err)
 				}
 
-				// Guardar la información
+				content, err := io.ReadAll(file)
+				if err != nil {
+					file.Close()
+					return nil, fmt.Errorf("error reading uploaded file: %w", err)
+				}
+				file.Close()
+
 				formFile := &FormFile{
-					Filename: fileHeader.Filename,
-					Size:     fileHeader.Size,
-					Header:   fileHeader.Header,
+					Filename: header.Filename,
+					Size:     header.Size,
+					Header:   header.Header,
 					Content:  content,
 				}
-				formFiles = append(formFiles, formFile)
-			}
 
-			f.Files[field] = formFiles
-		}
-	}
-
-	f.parsedMulti = true
-	return nil
-}
-
-// SaveFile guarda un archivo subido en el directorio de uploads.
-func (f *Form) SaveFile(field, filename string) (string, error) {
-	files, ok := f.Files[field]
-	if !ok || len(files) == 0 {
-		return "", fmt.Errorf("no file uploaded with field: %s", field)
-	}
-
-	file := files[0] // Tomar el primer archivo
-
-	// Generar ruta
-	if filename == "" {
-		filename = file.Filename
-	}
-	fullPath := filepath.Join(f.UploadDir, filename)
-
-	// Guardar el archivo
-	if err := os.WriteFile(fullPath, file.Content, 0644); err != nil {
-		return "", err
-	}
-
-	return fullPath, nil
-}
-
-// SaveFiles guarda todos los archivos subidos en el directorio de uploads.
-func (f *Form) SaveFiles(field string) ([]string, error) {
-	files, ok := f.Files[field]
-	if !ok || len(files) == 0 {
-		return nil, fmt.Errorf("no files uploaded with field: %s", field)
-	}
-
-	paths := make([]string, 0, len(files))
-
-	for _, file := range files {
-		fullPath := filepath.Join(f.UploadDir, file.Filename)
-
-		if err := os.WriteFile(fullPath, file.Content, 0644); err != nil {
-			// Limpiar archivos ya guardados en caso de error
-			for _, path := range paths {
-				os.Remove(path)
-			}
-			return nil, err
-		}
-
-		paths = append(paths, fullPath)
-	}
-
-	return paths, nil
-}
-
-// Bind mapea los valores del formulario a un struct y lo valida.
-func (f *Form) Bind(dst interface{}) error {
-	if err := f.Parse(); err != nil {
-		return err
-	}
-
-	// Mapear valores a struct
-	if err := f.mapValues(dst); err != nil {
-		return err
-	}
-
-	// Validar el struct resultante
-	if errs := ValidateStruct(dst); len(errs) > 0 {
-		f.Errors = errs
-		return errs
-	}
-
-	return nil
-}
-
-// mapValues mapea los valores del formulario a campos del struct.
-func (f *Form) mapValues(dst interface{}) error {
-	v := reflect.ValueOf(dst)
-	if v.Kind() != reflect.Ptr || v.IsNil() {
-		return fmt.Errorf("destination must be a non-nil pointer to struct")
-	}
-
-	v = v.Elem()
-	if v.Kind() != reflect.Struct {
-		return fmt.Errorf("destination must be a pointer to struct")
-	}
-
-	t := v.Type()
-	for i := 0; i < v.NumField(); i++ {
-		field := t.Field(i)
-
-		// Obtener nombre del campo desde tag form o usar nombre del campo
-		fieldName := field.Tag.Get("form")
-		if fieldName == "" {
-			fieldName = field.Name
-		}
-		if fieldName == "-" {
-			continue // Campo ignorado
-		}
-
-		// Si no existe el valor y no validamos vacíos, continuar
-		if _, exists := f.Values[fieldName]; !exists && !f.ValidateEmpty {
-			continue
-		}
-
-		if err := f.setFieldValue(v.Field(i), field, fieldName); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// setFieldValue establece el valor del campo según su tipo.
-func (f *Form) setFieldValue(field reflect.Value, structField reflect.StructField, name string) error {
-	if !field.CanSet() {
-		return nil
-	}
-
-	// Comprobar si es un campo de archivo
-	if structField.Tag.Get("form") == "file" {
-		return f.setFileField(field, name)
-	}
-
-	// Comprobar si tiene valores
-	values, exists := f.Values[name]
-	if !exists || len(values) == 0 {
-		return nil
-	}
-
-	// Setter según tipo de campo
-	switch field.Kind() {
-	case reflect.String:
-		field.SetString(values[0])
-
-	case reflect.Bool:
-		val := values[0]
-		field.SetBool(val == "true" || val == "1" || val == "on" || val == "yes")
-
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		val, err := strconv.ParseInt(values[0], 10, 64)
-		if err != nil {
-			return fmt.Errorf("invalid int value for field %s: %v", name, err)
-		}
-		field.SetInt(val)
-
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		val, err := strconv.ParseUint(values[0], 10, 64)
-		if err != nil {
-			return fmt.Errorf("invalid uint value for field %s: %v", name, err)
-		}
-		field.SetUint(val)
-
-	case reflect.Float32, reflect.Float64:
-		val, err := strconv.ParseFloat(values[0], 64)
-		if err != nil {
-			return fmt.Errorf("invalid float value for field %s: %v", name, err)
-		}
-		field.SetFloat(val)
-
-	case reflect.Slice:
-		// Para slices, usar todos los valores
-		if field.Type().Elem().Kind() == reflect.String {
-			slice := reflect.MakeSlice(field.Type(), len(values), len(values))
-			for i, val := range values {
-				slice.Index(i).SetString(val)
-			}
-			field.Set(slice)
-		}
-
-	case reflect.Struct:
-		// Tipos especiales como time.Time
-		if field.Type() == reflect.TypeOf(time.Time{}) {
-			// Intentar varios formatos de fecha/hora
-			formats := []string{
-				time.RFC3339,
-				"2006-01-02T15:04:05",
-				"2006-01-02 15:04:05",
-				"2006-01-02",
-			}
-
-			for _, format := range formats {
-				if t, err := time.Parse(format, values[0]); err == nil {
-					field.Set(reflect.ValueOf(t))
-					break
-				}
+				form.Files[field] = append(form.Files[field], formFile)
 			}
 		}
 	}
 
-	return nil
+	return form, nil
 }
 
-// setFileField maneja los campos de tipo archivo.
-func (f *Form) setFileField(field reflect.Value, name string) error {
-	files, exists := f.Files[name]
-	if !exists || len(files) == 0 {
-		return nil
-	}
-
-	// Según el tipo de campo
-	switch {
-	case field.Type() == reflect.TypeOf(FormFile{}):
-		// Para un único FormFile
-		if len(files) > 0 {
-			field.Set(reflect.ValueOf(*files[0]))
-		}
-	case field.Type() == reflect.TypeOf(&FormFile{}):
-		// Para un puntero a FormFile
-		if len(files) > 0 {
-			field.Set(reflect.ValueOf(files[0]))
-		}
-	case field.Type() == reflect.TypeOf([]*FormFile{}):
-		// Para un slice de punteros a FormFile
-		field.Set(reflect.ValueOf(files))
-	}
-
-	return nil
-}
-
-// HasErrors indica si hubo errores de validación.
-func (f *Form) HasErrors() bool {
-	return len(f.Errors) > 0
-}
-
-// GetErrors devuelve todos los errores de validación.
-func (f *Form) GetErrors() ValidationErrors {
-	return f.Errors
-}
-
-// GetError devuelve el primer error para un campo específico.
-func (f *Form) GetError(field string) string {
-	for _, err := range f.Errors {
-		if err.Field == field {
-			return err.Message
-		}
+// Get devuelve el primer valor para un campo del formulario.
+func (f *Form) Get(key string) string {
+	if vals, ok := f.Values[key]; ok && len(vals) > 0 {
+		return vals[0]
 	}
 	return ""
 }
 
-// BindForm procesa un formulario en el handler.
+// GetFile devuelve el primer archivo para un campo del formulario.
+func (f *Form) GetFile(key string) *FormFile {
+	if files, ok := f.Files[key]; ok && len(files) > 0 {
+		return files[0]
+	}
+	return nil
+}
+
+// GetAll devuelve todos los valores para un campo del formulario.
+func (f *Form) GetAll(key string) []string {
+	return f.Values[key]
+}
+
+// GetAllFiles devuelve todos los archivos para un campo del formulario.
+func (f *Form) GetAllFiles(key string) []*FormFile {
+	return f.Files[key]
+}
+
+// Required valida que un campo exista y no esté vacío.
+func (f *Form) Required(fields ...string) *Form {
+	for _, field := range fields {
+		if value := f.Get(field); value == "" {
+			f.Errors[field] = "This field is required"
+		}
+	}
+	return f
+}
+
+// MaxLength valida que un campo no exceda un largo máximo.
+func (f *Form) MaxLength(field string, d int) *Form {
+	if value := f.Get(field); value != "" && len(value) > d {
+		f.Errors[field] = fmt.Sprintf("This field cannot be longer than %d characters", d)
+	}
+	return f
+}
+
+// MinLength valida que un campo tenga un largo mínimo.
+func (f *Form) MinLength(field string, d int) *Form {
+	if value := f.Get(field); value != "" && len(value) < d {
+		f.Errors[field] = fmt.Sprintf("This field must be at least %d characters long", d)
+	}
+	return f
+}
+
+// IsEmail valida que un campo contenga un email válido.
+func (f *Form) IsEmail(field string) *Form {
+	value := f.Get(field)
+	if value == "" {
+		return f
+	}
+
+	re := regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
+	if !re.MatchString(value) {
+		f.Errors[field] = "Invalid email address"
+	}
+	return f
+}
+
+// IsInt valida que un campo contenga un número entero.
+func (f *Form) IsInt(field string) *Form {
+	value := f.Get(field)
+	if value == "" {
+		return f
+	}
+
+	_, err := strconv.Atoi(value)
+	if err != nil {
+		f.Errors[field] = "This field must be an integer"
+	}
+	return f
+}
+
+// IsFloat valida que un campo contenga un número decimal.
+func (f *Form) IsFloat(field string) *Form {
+	value := f.Get(field)
+	if value == "" {
+		return f
+	}
+
+	_, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		f.Errors[field] = "This field must be a number"
+	}
+	return f
+}
+
+// CustomValidation aplica una validación personalizada.
+func (f *Form) CustomValidation(field string, fn func(string) bool, message string) *Form {
+	value := f.Get(field)
+	if value == "" {
+		return f
+	}
+
+	if !fn(value) {
+		f.Errors[field] = message
+	}
+	return f
+}
+
+// Valid comprueba si el formulario no tiene errores.
+func (f *Form) Valid() bool {
+	f.validated = true
+	return len(f.Errors) == 0
+}
+
+// HasErrors devuelve true si el formulario tiene errores.
+func (f *Form) HasErrors() bool {
+	return len(f.Errors) > 0
+}
+
+// GetErrors devuelve todos los errores.
+func (f *Form) GetErrors() map[string]string {
+	return f.Errors
+}
+
+// AddError agrega un error manualmente.
+func (f *Form) AddError(field, message string) *Form {
+	f.Errors[field] = message
+	return f
+}
+
+// SaveFile guarda un archivo subido en una ubicación específica.
+func (f *Form) SaveFile(fieldName, targetDir string) (string, error) {
+	file := f.GetFile(fieldName)
+	if file == nil {
+		return "", fmt.Errorf("no file uploaded for field %s", fieldName)
+	}
+
+	if targetDir == "" {
+		targetDir = os.TempDir()
+	}
+
+	// Crear directorio si no existe
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Generar nombre de archivo único si es necesario
+	fileName := file.Filename
+	if fileName == "" {
+		fileName = fmt.Sprintf("upload_%d_%s", time.Now().UnixNano(), strconv.Itoa(int(time.Now().Unix())))
+	}
+
+	// Crear ruta completa
+	filePath := filepath.Join(targetDir, fileName)
+
+	// Escribir archivo
+	if err := os.WriteFile(filePath, file.Content, 0644); err != nil {
+		return "", fmt.Errorf("failed to write file: %w", err)
+	}
+
+	return filePath, nil
+}
+
+// Bind completa un struct con datos del formulario usando reflection.
+func (f *Form) Bind(obj interface{}) error {
+	// Validate forms first
+	if !f.validated {
+		if !f.Valid() {
+			return fmt.Errorf("form validation failed: %v", f.Errors)
+		}
+	}
+
+	val := reflect.ValueOf(obj)
+	if val.Kind() != reflect.Ptr || val.IsNil() {
+		return fmt.Errorf("bind requires a non-nil pointer")
+	}
+
+	// Desreferencia el puntero
+	val = val.Elem()
+	if val.Kind() != reflect.Struct {
+		return fmt.Errorf("bind requires a struct pointer")
+	}
+
+	typ := val.Type()
+
+	// Recorre los campos del struct
+	for i := 0; i < val.NumField(); i++ {
+		field := val.Field(i)
+		if !field.CanSet() {
+			continue
+		}
+
+		typeField := typ.Field(i)
+		formKey := typeField.Tag.Get("form")
+		if formKey == "" {
+			formKey = typeField.Name
+		}
+
+		// Si el campo es un archivo
+		if typeField.Type == reflect.TypeOf(&FormFile{}) && f.GetFile(formKey) != nil {
+			file := f.GetFile(formKey)
+			field.Set(reflect.ValueOf(file))
+			continue
+		}
+
+		// Para valores normales
+		formVal := f.Get(formKey)
+		if formVal == "" {
+			continue
+		}
+
+		switch field.Kind() {
+		case reflect.String:
+			field.SetString(formVal)
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			intVal, err := strconv.ParseInt(formVal, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid integer value for field %s: %w", formKey, err)
+			}
+			field.SetInt(intVal)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			uintVal, err := strconv.ParseUint(formVal, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid unsigned integer value for field %s: %w", formKey, err)
+			}
+			field.SetUint(uintVal)
+		case reflect.Float32, reflect.Float64:
+			floatVal, err := strconv.ParseFloat(formVal, 64)
+			if err != nil {
+				return fmt.Errorf("invalid float value for field %s: %w", formKey, err)
+			}
+			field.SetFloat(floatVal)
+		case reflect.Bool:
+			boolVal := false
+			if formVal == "on" || formVal == "true" || formVal == "1" || formVal == "yes" {
+				boolVal = true
+			}
+			field.SetBool(boolVal)
+		}
+	}
+
+	return nil
+}
+
+// BindForm procesa un formulario, lo valida y enlaza a un struct.
 func BindForm[T any](h func(http.ResponseWriter, *http.Request, Params, *Form, T)) HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request, p Params) {
 		var obj T
-		form := NewForm(r)
-		if err := form.Bind(&obj); err != nil {
-			// Si son errores de validación, los pasamos al handler
-			if verr, ok := err.(ValidationErrors); ok {
-				form.Errors = verr
-				h(w, r, p, form, obj)
-				return
-			}
-			// Otro tipo de error (parseo, etc.)
-			Error(w, http.StatusBadRequest, fmt.Sprintf("error processing form: %v", err))
+
+		// Crear y procesar formulario
+		form, err := NewForm(r, 32<<20) // 32MB limit
+		if err != nil {
+			http.Error(w, fmt.Sprintf("error processing form: %v", err), http.StatusBadRequest)
 			return
 		}
 
+		// Enlazar datos al struct
+		if err := form.Bind(&obj); err != nil {
+			form.AddError("_form", err.Error())
+		}
+
+		// Validar struct usando tags validate
+		if errs := ValidateStruct(obj); len(errs) > 0 {
+			for _, e := range errs {
+				form.AddError(e.Field, e.Message)
+			}
+		}
+
+		// Llamar al handler con el formulario y el objeto enlazado
 		h(w, r, p, form, obj)
 	}
 }

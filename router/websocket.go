@@ -1,10 +1,15 @@
 package router
 
 import (
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,346 +17,537 @@ import (
 // WebSocketConnection represents a client connection
 type WebSocketConnection struct {
 	// Standard websocket connection
-	Conn        *http.ResponseWriter
+	Conn        http.ResponseWriter
 	Request     *http.Request
-	Params      Params
 	ID          string
-	SendChan    chan []byte
-	ReceiveChan chan []byte
-	closeChan   chan struct{}
-	closed      bool
-	mu          sync.RWMutex
 	Hub         *WebSocketHub
-	Metadata    map[string]interface{}
+	Send        chan []byte
+	isConnected bool
+	closeMutex  sync.Mutex
 }
 
-// WebSocketHub manages multiple WebSocket connections
-type WebSocketHub struct {
-	// Registered connections
-	connections map[string]*WebSocketConnection
-	// Inbound messages from connections
-	broadcast chan []byte
-	// Register requests from connections
-	register chan *WebSocketConnection
-	// Unregister requests from connections
-	unregister chan *WebSocketConnection
-	// Custom message handler
-	messageHandler func(*WebSocketConnection, []byte)
-	// Hub lock
-	mu sync.RWMutex
-}
-
-// WebSocketHandlerFunc defines a function that handles WebSocket connections
-type WebSocketHandlerFunc func(*WebSocketConnection, *http.Request, Params)
-
-// WebSocketConfig contains configuration for the WebSocket handler
-type WebSocketConfig struct {
-	// Path for the WebSocket endpoint
-	Path string
-	// Message handler function
-	MessageHandler func(*WebSocketConnection, []byte)
-	// Connection handler function called when a new connection is established
-	OnConnect WebSocketHandlerFunc
-	// Disconnection handler function called when a connection is closed
-	OnDisconnect WebSocketHandlerFunc
-	// Ping interval in seconds (0 to disable)
-	PingInterval int
-	// Allowed origins for WebSocket connections (empty for all)
-	AllowedOrigins []string
-	// Maximum message size in bytes
-	MaxMessageSize int64
-	// Hub for broadcasting messages
-	Hub *WebSocketHub
-}
-
-// WebSocketMessage represents a structured message
-type WebSocketMessage struct {
-	Type    string      `json:"type"`
-	Payload interface{} `json:"payload,omitempty"`
-}
-
-// NewWebSocketHub creates a new hub for WebSocket connections
-func NewWebSocketHub(messageHandler func(*WebSocketConnection, []byte)) *WebSocketHub {
-	return &WebSocketHub{
-		connections:    make(map[string]*WebSocketConnection),
-		broadcast:      make(chan []byte),
-		register:       make(chan *WebSocketConnection),
-		unregister:     make(chan *WebSocketConnection),
-		messageHandler: messageHandler,
+// SendText sends a text message to the client
+func (c *WebSocketConnection) SendText(msg string) error {
+	if !c.isConnected {
+		return fmt.Errorf("connection closed")
 	}
+	frame := newTextFrame([]byte(msg))
+	_, err := c.Conn.Write(frame)
+	return err
 }
 
-// Run starts the hub's main loop
-func (h *WebSocketHub) Run() {
-	for {
-		select {
-		case conn := <-h.register:
-			h.mu.Lock()
-			h.connections[conn.ID] = conn
-			h.mu.Unlock()
-		case conn := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.connections[conn.ID]; ok {
-				delete(h.connections, conn.ID)
-				close(conn.SendChan)
-			}
-			h.mu.Unlock()
-		case message := <-h.broadcast:
-			h.mu.RLock()
-			for _, conn := range h.connections {
-				select {
-				case conn.SendChan <- message:
-				default:
-					close(conn.SendChan)
-					h.mu.RUnlock()
-					h.mu.Lock()
-					delete(h.connections, conn.ID)
-					h.mu.Unlock()
-					h.mu.RLock()
-				}
-			}
-			h.mu.RUnlock()
-		}
-	}
-}
-
-// Broadcast sends a message to all connected clients
-func (h *WebSocketHub) Broadcast(message []byte) {
-	h.broadcast <- message
-}
-
-// GetConnection returns a WebSocket connection by ID
-func (h *WebSocketHub) GetConnection(id string) (*WebSocketConnection, bool) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	conn, ok := h.connections[id]
-	return conn, ok
-}
-
-// GetConnectionCount returns the number of active connections
-func (h *WebSocketHub) GetConnectionCount() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.connections)
-}
-
-// ForEachConnection iterates over all connections and applies a function
-func (h *WebSocketHub) ForEachConnection(f func(*WebSocketConnection)) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for _, conn := range h.connections {
-		f(conn)
-	}
-}
-
-// Send sends data to the WebSocket connection
-func (c *WebSocketConnection) Send(data []byte) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.closed {
-		return
-	}
-	c.SendChan <- data
-}
-
-// SendJSON marshals and sends JSON data
+// SendJSON marshals and sends a JSON message to the client
 func (c *WebSocketConnection) SendJSON(v interface{}) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	c.Send(data)
-	return nil
+	return c.SendText(string(data))
 }
 
-// Close closes the WebSocket connection
+// Send binary data to the client
+func (c *WebSocketConnection) SendBinary(data []byte) error {
+	if !c.isConnected {
+		return fmt.Errorf("connection closed")
+	}
+	frame := newBinaryFrame(data)
+	_, err := c.Conn.Write(frame)
+	return err
+}
+
+// Close the connection with normal closure
 func (c *WebSocketConnection) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
+	c.closeMutex.Lock()
+	defer c.closeMutex.Unlock()
+
+	if !c.isConnected {
 		return
 	}
-	c.closed = true
-	close(c.closeChan)
-	// Unregister from hub
+
+	// Send close frame
+	closeFrame := []byte{0x88, 0x02, 0x03, 0xE8} // Normal closure (1000)
+	c.Conn.Write(closeFrame)
+	c.isConnected = false
+
+	// Remove from hub if present
 	if c.Hub != nil {
-		c.Hub.unregister <- c
+		c.Hub.Unregister <- c
 	}
 }
 
-// WithWebSocketHandler adds a WebSocket handler to the router
+// WebSocketHub manages a collection of connections
+type WebSocketHub struct {
+	// Registered connections
+	Connections map[*WebSocketConnection]bool
+
+	// Register requests
+	Register chan *WebSocketConnection
+
+	// Unregister requests
+	Unregister chan *WebSocketConnection
+
+	// Inbound messages to broadcast
+	Broadcast chan []byte
+
+	// Room identifier if in room mode
+	Room string
+
+	// Configuration
+	Config WebSocketConfig
+}
+
+// NewWebSocketHub creates a new hub
+func NewWebSocketHub(room string, cfg WebSocketConfig) *WebSocketHub {
+	return &WebSocketHub{
+		Connections: make(map[*WebSocketConnection]bool),
+		Register:    make(chan *WebSocketConnection),
+		Unregister:  make(chan *WebSocketConnection),
+		Broadcast:   make(chan []byte),
+		Room:        room,
+		Config:      cfg,
+	}
+}
+
+// Run starts the hub's event loop
+func (h *WebSocketHub) Run() {
+	for {
+		select {
+		case conn := <-h.Register:
+			h.Connections[conn] = true
+			if h.Config.OnConnect != nil {
+				h.Config.OnConnect(conn)
+			}
+
+		case conn := <-h.Unregister:
+			if _, ok := h.Connections[conn]; ok {
+				delete(h.Connections, conn)
+				close(conn.Send)
+				if h.Config.OnDisconnect != nil {
+					h.Config.OnDisconnect(conn)
+				}
+			}
+
+		case msg := <-h.Broadcast:
+			for conn := range h.Connections {
+				select {
+				case conn.Send <- msg:
+				default:
+					close(conn.Send)
+					delete(h.Connections, conn)
+				}
+			}
+		}
+	}
+}
+
+// Broadcast sends a message to all connected clients
+func (h *WebSocketHub) BroadcastMessage(msg []byte) {
+	h.Broadcast <- msg
+}
+
+// Count returns the number of active connections
+func (h *WebSocketHub) Count() int {
+	return len(h.Connections)
+}
+
+// WebSocketConfig contains the configuration for a WebSocket endpoint
+type WebSocketConfig struct {
+	Path           string
+	MaxMessageSize int
+	PingInterval   time.Duration
+	AllowedOrigins []string
+	MessageHandler func(conn *WebSocketConnection, msg []byte)
+	OnConnect      func(conn *WebSocketConnection)
+	OnDisconnect   func(conn *WebSocketConnection)
+}
+
+// WebSocketHandler handles a WebSocket connection
+func WebSocketHandler(config WebSocketConfig) HandlerFunc {
+	if config.MaxMessageSize == 0 {
+		config.MaxMessageSize = 4096 // 4KB default
+	}
+
+	if config.PingInterval == 0 {
+		config.PingInterval = 30 * time.Second
+	}
+
+	hub := NewWebSocketHub("", config)
+	go hub.Run()
+
+	return func(w http.ResponseWriter, r *http.Request, params Params) {
+		// Check origin if configured
+		if len(config.AllowedOrigins) > 0 {
+			origin := r.Header.Get("Origin")
+			allowed := false
+			for _, o := range config.AllowedOrigins {
+				if o == "*" || o == origin {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				http.Error(w, "Origin not allowed", http.StatusForbidden)
+				return
+			}
+		}
+
+		// Verify it's a websocket upgrade request
+		if !isWebSocketUpgrade(r) {
+			http.Error(w, "Expected WebSocket Upgrade", http.StatusBadRequest)
+			return
+		}
+
+		// Perform handshake
+		if !performHandshake(w, r) {
+			http.Error(w, "WebSocket handshake failed", http.StatusBadRequest)
+			return
+		}
+
+		conn := &WebSocketConnection{
+			Conn:        w,
+			Request:     r,
+			ID:          fmt.Sprintf("%d", time.Now().UnixNano()),
+			Hub:         hub,
+			Send:        make(chan []byte, 256),
+			isConnected: true,
+		}
+
+		hub.Register <- conn
+
+		// Start handling the connection
+		go handleWebSocketConnection(conn, config)
+	}
+}
+
+// isWebSocketUpgrade checks if the request is a WebSocket upgrade
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+}
+
+// performHandshake completes the WebSocket opening handshake
+func performHandshake(w http.ResponseWriter, r *http.Request) bool {
+	// Get the WebSocket key
+	key := r.Header.Get("Sec-WebSocket-Key")
+	if key == "" {
+		return false
+	}
+
+	// Calculate accept key (per RFC6455)
+	h := sha1.New()
+	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	acceptKey := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	// Set response headers
+	headers := w.Header()
+	headers.Set("Upgrade", "websocket")
+	headers.Set("Connection", "Upgrade")
+	headers.Set("Sec-WebSocket-Accept", acceptKey)
+
+	// Write response status
+	w.WriteHeader(http.StatusSwitchingProtocols)
+
+	return true
+}
+
+// handleWebSocketConnection reads frames and dispatches them
+func handleWebSocketConnection(conn *WebSocketConnection, config WebSocketConfig) {
+	hijacker, ok := conn.Conn.(http.Hijacker)
+	if !ok {
+		log.Println("WebSocket error: connection doesn't support hijacking")
+		return
+	}
+
+	netConn, bufrw, err := hijacker.Hijack()
+	if err != nil {
+		log.Printf("WebSocket hijack failed: %v", err)
+		return
+	}
+	defer netConn.Close()
+
+	// Set deadlines
+	readDeadline := time.Now().Add(config.PingInterval + 10*time.Second)
+	netConn.SetReadDeadline(readDeadline)
+
+	// Read loop
+	for {
+		// Read frame header
+		frameHeader := make([]byte, 2)
+		if _, err := io.ReadFull(bufrw, frameHeader); err != nil {
+			break
+		}
+
+		// Parse first two bytes for opcode and mask bit
+		fin := (frameHeader[0] & 0x80) != 0
+		opcode := frameHeader[0] & 0x0F
+		masked := (frameHeader[1] & 0x80) != 0
+		payloadLen := int(frameHeader[1] & 0x7F)
+
+		// Handle extended payload length
+		if payloadLen == 126 {
+			extLen := make([]byte, 2)
+			if _, err := io.ReadFull(bufrw, extLen); err != nil {
+				break
+			}
+			payloadLen = int(binary.BigEndian.Uint16(extLen))
+		} else if payloadLen == 127 {
+			extLen := make([]byte, 8)
+			if _, err := io.ReadFull(bufrw, extLen); err != nil {
+				break
+			}
+			payloadLen = int(binary.BigEndian.Uint64(extLen))
+		}
+
+		// Limit payload size
+		if payloadLen > config.MaxMessageSize {
+			log.Printf("WebSocket message too large: %d bytes", payloadLen)
+			conn.Close()
+			break
+		}
+
+		// Read masking key if present
+		var maskKey []byte
+		if masked {
+			maskKey = make([]byte, 4)
+			if _, err := io.ReadFull(bufrw, maskKey); err != nil {
+				break
+			}
+		}
+
+		// Read payload
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(bufrw, payload); err != nil {
+			break
+		}
+
+		// Unmask the payload if needed
+		if masked {
+			for i := 0; i < payloadLen; i++ {
+				payload[i] ^= maskKey[i%4]
+			}
+		}
+
+		// Handle based on opcode
+		switch opcode {
+		case 0x1: // Text frame
+			if config.MessageHandler != nil {
+				config.MessageHandler(conn, payload)
+			}
+
+		case 0x2: // Binary frame
+			if config.MessageHandler != nil {
+				config.MessageHandler(conn, payload)
+			}
+
+		case 0x8: // Close frame
+			conn.Close()
+			return
+
+		case 0x9: // Ping frame, respond with pong
+			pongFrame := newPongFrame(payload)
+			netConn.Write(pongFrame)
+
+		case 0xA: // Pong frame, reset deadline
+			netConn.SetReadDeadline(time.Now().Add(config.PingInterval + 10*time.Second))
+		}
+
+		if !fin {
+			// TODO: handle message fragmentation
+			log.Println("WebSocket: fragmentation not supported yet")
+		}
+	}
+}
+
+// Helper functions for creating WebSocket frames
+func newTextFrame(data []byte) []byte {
+	return createFrame(0x1, data)
+}
+
+func newBinaryFrame(data []byte) []byte {
+	return createFrame(0x2, data)
+}
+
+func newPingFrame(data []byte) []byte {
+	return createFrame(0x9, data)
+}
+
+func newPongFrame(data []byte) []byte {
+	return createFrame(0xA, data)
+}
+
+func createFrame(opcode byte, data []byte) []byte {
+	length := len(data)
+	var header []byte
+
+	// First byte: FIN bit + opcode
+	b0 := 0x80 | opcode // FIN=1, opcode=given
+
+	// Second byte: MASK bit + payload length
+	var b1 byte
+	var extBytes []byte
+
+	if length < 126 {
+		b1 = byte(length)
+		header = []byte{b0, b1}
+	} else if length <= 65535 {
+		b1 = 126
+		extBytes = make([]byte, 2)
+		binary.BigEndian.PutUint16(extBytes, uint16(length))
+		header = []byte{b0, b1}
+		header = append(header, extBytes...)
+	} else {
+		b1 = 127
+		extBytes = make([]byte, 8)
+		binary.BigEndian.PutUint64(extBytes, uint64(length))
+		header = []byte{b0, b1}
+		header = append(header, extBytes...)
+	}
+
+	// Add payload
+	frame := append(header, data...)
+	return frame
+}
+
+// WebSocket functions for the router
+
+// WithGorillaWebSocket adds WebSocket support to the router (compatibility layer but implements natively)
+func WithGorillaWebSocket() Option {
+	return func(r *MoraRouter) {
+		// This is just a placeholder for compatibility
+		// Our implementation doesn't require gorilla/websocket
+	}
+}
+
+// WithChatRoom adds a basic chat room at the given path
+func WithChatRoom(path string) Option {
+	return func(r *MoraRouter) {
+		config := WebSocketConfig{
+			Path:           path,
+			MaxMessageSize: 1024 * 64, // 64KB
+			MessageHandler: func(conn *WebSocketConnection, msg []byte) {
+				// Broadcast message to all clients
+				conn.Hub.BroadcastMessage(msg)
+			},
+			OnConnect: func(conn *WebSocketConnection) {
+				// Notify that a new user has joined
+				conn.Hub.BroadcastMessage([]byte(fmt.Sprintf("* User joined (Total: %d)", conn.Hub.Count())))
+			},
+			OnDisconnect: func(conn *WebSocketConnection) {
+				// Notify that a user has left
+				conn.Hub.BroadcastMessage([]byte(fmt.Sprintf("* User left (Total: %d)", conn.Hub.Count())))
+			},
+		}
+
+		r.WebSocket(path, config.MessageHandler)
+
+		// Also add a basic chat UI
+		chatUI := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MoraRouter Chat</title>
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; }
+        #chat { max-width: 800px; margin: 0 auto; padding: 20px; }
+        #messages { height: 300px; border: 1px solid #ccc; overflow-y: scroll; margin-bottom: 10px; padding: 10px; }
+        #input-area { display: flex; }
+        #message { flex: 1; padding: 8px; }
+        button { padding: 8px 16px; background: #0066ff; color: white; border: none; cursor: pointer; }
+        .system { color: #999; font-style: italic; }
+    </style>
+</head>
+<body>
+    <div id="chat">
+        <h2>MoraRouter Chat</h2>
+        <div id="messages"></div>
+        <div id="input-area">
+            <input id="message" type="text" placeholder="Type a message..." autocomplete="off">
+            <button onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+    
+    <script>
+        const messages = document.getElementById('messages');
+        const messageInput = document.getElementById('message');
+        
+        // Create WebSocket connection
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(protocol + '//' + location.host + '` + path + `');
+        
+        ws.onopen = function() {
+            addMessage('Connected to chat server', true);
+        };
+        
+        ws.onmessage = function(e) {
+            const msg = e.data;
+            if (msg.startsWith('* ')) {
+                addMessage(msg, true);
+            } else {
+                addMessage(msg, false);
+            }
+        };
+        
+        ws.onclose = function() {
+            addMessage('Disconnected from chat server', true);
+        };
+        
+        function addMessage(text, isSystem) {
+            const div = document.createElement('div');
+            if (isSystem) div.className = 'system';
+            div.textContent = text;
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+        
+        function sendMessage() {
+            const text = messageInput.value.trim();
+            if (text) {
+                ws.send(text);
+                messageInput.value = '';
+            }
+        }
+        
+        // Handle Enter key
+        messageInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+    </script>
+</body>
+</html>
+`
+		r.Get(path+"-ui", func(w http.ResponseWriter, r *http.Request, p Params) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write([]byte(chatUI))
+		})
+	}
+}
+
+// WebSocket adds a WebSocket handler for the given path
+func (r *MoraRouter) WebSocket(path string, handler func(*WebSocketConnection, []byte)) {
+	config := WebSocketConfig{
+		Path:           path,
+		MessageHandler: handler,
+		MaxMessageSize: 1024 * 64, // 64KB default
+		PingInterval:   30 * time.Second,
+	}
+
+	r.Get(path, WebSocketHandler(config))
+}
+
+// WithWebSocketHandler adds a WebSocket handler with custom configuration
 func WithWebSocketHandler(config WebSocketConfig) Option {
 	return func(r *MoraRouter) {
-		// Create default hub if none provided
-		if config.Hub == nil && config.MessageHandler != nil {
-			config.Hub = NewWebSocketHub(config.MessageHandler)
-			go config.Hub.Run()
-		}
-
-		r.Get(config.Path, func(w http.ResponseWriter, req *http.Request, p Params) {
-			// WebSocket upgrade and connection handling will go here
-			// This is a placeholder - the real implementation would use gorilla/websocket
-			wsConn := &WebSocketConnection{
-				Conn:        &w,
-				Request:     req,
-				Params:      p,
-				ID:          fmt.Sprintf("%s-%d", req.RemoteAddr, time.Now().UnixNano()),
-				SendChan:    make(chan []byte, 256),
-				ReceiveChan: make(chan []byte, 256),
-				closeChan:   make(chan struct{}),
-				Hub:         config.Hub,
-				Metadata:    make(map[string]interface{}),
-			}
-
-			// Register with hub if available
-			if config.Hub != nil {
-				config.Hub.register <- wsConn
-			}
-
-			// Call OnConnect handler if provided
-			if config.OnConnect != nil {
-				config.OnConnect(wsConn, req, p)
-			}
-
-			// Write upgrade error
-			log.Println("WebSocket upgrade would happen here - implement with gorilla/websocket")
-			http.Error(w, "WebSocket support requires the gorilla/websocket package", http.StatusNotImplemented)
-		})
+		r.Get(config.Path, WebSocketHandler(config))
 	}
 }
 
-// WithWebSockets adds support for WebSocket connections
-func WithWebSockets(paths map[string]WebSocketHandlerFunc) Option {
+// WithWebSockets allows multiple WebSocket endpoints to be defined at once
+func WithWebSockets(handlers map[string]func(*WebSocketConnection, []byte)) Option {
 	return func(r *MoraRouter) {
-		for path, handler := range paths {
-			config := WebSocketConfig{
-				Path:      path,
-				OnConnect: handler,
-			}
-			WithWebSocketHandler(config)(r)
+		for path, handler := range handlers {
+			r.WebSocket(path, handler)
 		}
-	}
-}
-
-// WebSocketRoomOption defines options for creating a WebSocket room
-type WebSocketRoomOption struct {
-	// Authentication function
-	Auth func(r *http.Request) bool
-	// Maximum connections per room
-	MaxConnections int
-	// Message types handled by the room
-	MessageTypes []string
-	// Custom message handler
-	MessageHandler func(*WebSocketConnection, []byte)
-}
-
-// WithRoomProvider adds a WebSocket room provider
-func WithRoomProvider(pathPrefix string, options WebSocketRoomOption) Option {
-	return func(r *MoraRouter) {
-		// Map to store room hubs, keyed by room ID
-		rooms := make(map[string]*WebSocketHub)
-		var roomsMu sync.RWMutex
-
-		// Handler for room WebSocket connections
-		r.Get(pathPrefix+"/:roomID/ws", func(w http.ResponseWriter, req *http.Request, p Params) {
-			roomID := p["roomID"]
-
-			// Authentication check
-			if options.Auth != nil && !options.Auth(req) {
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
-
-			// Find or create the room
-			roomsMu.Lock()
-			hub, exists := rooms[roomID]
-			if !exists {
-				hub = NewWebSocketHub(options.MessageHandler)
-				rooms[roomID] = hub
-				go hub.Run()
-			}
-			roomsMu.Unlock()
-
-			// Check room capacity
-			if options.MaxConnections > 0 && hub.GetConnectionCount() >= options.MaxConnections {
-				http.Error(w, "Room is full", http.StatusServiceUnavailable)
-				return
-			}
-
-			// WebSocket connection placeholder
-			wsConn := &WebSocketConnection{
-				Conn:        &w,
-				Request:     req,
-				Params:      p,
-				ID:          fmt.Sprintf("%s-%d", req.RemoteAddr, time.Now().UnixNano()),
-				SendChan:    make(chan []byte, 256),
-				ReceiveChan: make(chan []byte, 256),
-				closeChan:   make(chan struct{}),
-				Hub:         hub,
-				Metadata:    make(map[string]interface{}),
-			}
-
-			// Register connection with hub
-			hub.register <- wsConn
-
-			// Write upgrade error (placeholder for real implementation)
-			http.Error(w, "WebSocket support requires the gorilla/websocket package", http.StatusNotImplemented)
-		})
-
-		// API endpoints for room management
-		r.Get(pathPrefix, func(w http.ResponseWriter, req *http.Request, p Params) {
-			roomsMu.RLock()
-			roomList := make([]map[string]interface{}, 0, len(rooms))
-			for id, hub := range rooms {
-				roomList = append(roomList, map[string]interface{}{
-					"id":              id,
-					"connectionCount": hub.GetConnectionCount(),
-				})
-			}
-			roomsMu.RUnlock()
-
-			JSON(w, http.StatusOK, roomList)
-		})
-
-		r.Get(pathPrefix+"/:roomID", func(w http.ResponseWriter, req *http.Request, p Params) {
-			roomID := p["roomID"]
-
-			roomsMu.RLock()
-			hub, exists := rooms[roomID]
-			roomsMu.RUnlock()
-
-			if !exists {
-				http.Error(w, "Room not found", http.StatusNotFound)
-				return
-			}
-
-			connections := make([]string, 0)
-			hub.ForEachConnection(func(conn *WebSocketConnection) {
-				connections = append(connections, conn.ID)
-			})
-
-			JSON(w, http.StatusOK, map[string]interface{}{
-				"id":              roomID,
-				"connectionCount": hub.GetConnectionCount(),
-				"connections":     connections,
-			})
-		})
-
-		r.Delete(pathPrefix+"/:roomID", func(w http.ResponseWriter, req *http.Request, p Params) {
-			roomID := p["roomID"]
-
-			roomsMu.Lock()
-			hub, exists := rooms[roomID]
-			if exists {
-				delete(rooms, roomID)
-				// Close all connections
-				hub.ForEachConnection(func(conn *WebSocketConnection) {
-					conn.Close()
-				})
-			}
-			roomsMu.Unlock()
-
-			w.WriteHeader(http.StatusNoContent)
-		})
 	}
 }
