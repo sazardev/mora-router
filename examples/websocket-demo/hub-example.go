@@ -13,81 +13,121 @@ func runHubExample() {
 	// Create router with WebSocket support
 	r := router.New(router.WithGorillaWebSocket())
 
-	// Create a WebSocket hub for broadcasting messages
-	hub := router.NewWebSocketHub("global", router.WebSocketConfig{
+	// Create a shared WebSocket config with the hub
+	sharedConfig := router.WebSocketConfig{
+		Path:           "/hub",
 		MaxMessageSize: 1024 * 64,
 		PingInterval:   30 * time.Second,
+		MessageHandler: func(conn *router.WebSocketConnection, msg []byte) {
+			// Log the message
+			log.Printf("Received message from %s: %s", conn.ID, string(msg))
+
+			// Format the message with sender ID
+			formattedMsg := fmt.Sprintf("User %s: %s", conn.ID[len(conn.ID)-4:], string(msg))
+
+			// Broadcast formatted message to all clients
+			conn.Hub.BroadcastMessage([]byte(formattedMsg))
+		},
 		OnConnect: func(conn *router.WebSocketConnection) {
 			log.Printf("New connection: %s", conn.ID)
-			conn.SendText("Welcome to the hub example!")
-			conn.Hub.BroadcastMessage([]byte("New user connected!"))
+
+			// Send welcome message to the new client
+			conn.SendText("¡Bienvenido al hub de chat!")
+
+			// Notify all clients about new user
+			userID := conn.ID[len(conn.ID)-4:] // Use last 4 digits as user identifier
+			conn.Hub.BroadcastMessage([]byte(fmt.Sprintf("🟢 Usuario %s se ha conectado", userID)))
 		},
 		OnDisconnect: func(conn *router.WebSocketConnection) {
 			log.Printf("Connection closed: %s", conn.ID)
-			conn.Hub.BroadcastMessage([]byte("A user has disconnected"))
+
+			// Notify all clients about user disconnection
+			userID := conn.ID[len(conn.ID)-4:]
+			conn.Hub.BroadcastMessage([]byte(fmt.Sprintf("🔴 Usuario %s se ha desconectado", userID)))
 		},
-	})
+	}
 
-	// Start the hub's event loop
-	go hub.Run()
-
-	// WebSocket endpoint that uses the hub
-	r.WebSocket("/hub", func(conn *router.WebSocketConnection, msg []byte) {
-		log.Printf("Received message from %s: %s", conn.ID, string(msg))
-
-		// Broadcast the message to all clients
-		hub.BroadcastMessage(msg)
-	})
+	// Add the WebSocket handler with the shared config
+	r.Get("/hub", router.WebSocketHandler(sharedConfig))
 
 	// Serve a simple HTML demo page
 	r.Get("/hub-demo", func(w http.ResponseWriter, r *http.Request, p router.Params) {
 		html := `<!DOCTYPE html>
 <html>
 <head>
-    <title>MoraRouter WebSocket Hub Demo</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-        .container { border: 1px solid #ccc; padding: 20px; margin-bottom: 20px; }
-        .output { height: 300px; overflow-y: scroll; border: 1px solid #eee; padding: 10px; margin-top: 10px; }
+    <title>MoraRouter WebSocket Hub Demo</title>    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        .container { border: 1px solid #ddd; border-radius: 8px; padding: 20px; background: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .output { height: 400px; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; margin-top: 10px; background: #fafafa; border-radius: 4px; }
         .message-form { display: flex; margin-top: 10px; }
-        .message-input { flex: 1; padding: 8px; }
-        button { padding: 8px 16px; background: #0066ff; color: white; border: none; cursor: pointer; }
-        .system-msg { color: #777; font-style: italic; }
+        .message-input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px 0 0 4px; font-size: 16px; }
+        button { padding: 10px 20px; background: #0066ff; color: white; border: none; border-radius: 0 4px 4px 0; cursor: pointer; font-weight: bold; }
+        button:hover { background: #0052cc; }
+        .system-msg { color: #666; font-style: italic; padding: 5px; border-left: 3px solid #ccc; margin: 5px 0; }
+        .user-msg { padding: 8px 12px; margin: 5px 0; border-radius: 10px; background: #e1f5fe; }
+        h1 { color: #333; }
+        h2 { color: #0066ff; margin-bottom: 5px; }
+        .status { font-weight: bold; }
+        .status.online { color: #4caf50; }
+        .status.offline { color: #f44336; }
+        .user-count { font-size: 14px; color: #666; float: right; }
+        .info-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
     </style>
 </head>
 <body>
-    <h1>WebSocket Hub Example</h1>
+    <h1>Chat en Tiempo Real con MoraRouter</h1>
     
     <div class="container">
-        <h2>Broadcast Hub</h2>
-        <p>All connected clients will receive messages</p>
+        <div class="info-bar">
+            <h2>Chat Público</h2>
+            <span class="status online" id="connection-status">Conectado</span>
+        </div>
+        <p>Todos los mensajes se transmiten a todos los clientes conectados</p>
         
         <div id="hub-output" class="output"></div>
         
         <div class="message-form">
-            <input id="hub-message" class="message-input" type="text" placeholder="Type a message..." autocomplete="off">
-            <button onclick="sendHubMessage()">Send</button>
+            <input id="hub-message" class="message-input" type="text" placeholder="Escribe un mensaje..." autocomplete="off">
+            <button onclick="sendHubMessage()">Enviar</button>
         </div>
     </div>
     
     <script>
         // Hub WebSocket
         const hubWs = new WebSocket('ws://' + location.host + '/hub');
+        let reconnectAttempts = 0;
         
         hubWs.onopen = function() {
-            logHub('Connected to hub', true);
+            document.getElementById('connection-status').className = 'status online';
+            document.getElementById('connection-status').textContent = 'Conectado';
+            logHub('Conectado al servidor de chat', true);
+            reconnectAttempts = 0;
         };
         
         hubWs.onmessage = function(e) {
-            logHub('Broadcast: ' + e.data);
+            // Check if it's a system message
+            const isSystem = e.data.startsWith('🟢') || e.data.startsWith('🔴') || e.data.startsWith('¡Bienvenido');
+            logHub(e.data, isSystem);
         };
-        
-        hubWs.onclose = function() {
-            logHub('Disconnected from hub', true);
+          hubWs.onclose = function() {
+            document.getElementById('connection-status').className = 'status offline';
+            document.getElementById('connection-status').textContent = 'Desconectado';
+            logHub('Desconectado del servidor de chat. Intentando reconectar...', true);
+            
+            // Try to reconnect with exponential backoff
+            setTimeout(function() {
+                reconnectAttempts++;
+                const timeout = Math.min(30000, Math.pow(2, reconnectAttempts) * 1000);
+                logHub("Intento de reconexión " + reconnectAttempts + " en " + (timeout/1000) + " segundos...", true);
+                
+                // Reconnect
+                setTimeout(function() {
+                    window.hubWs = new WebSocket('ws://' + location.host + '/hub');
+                }, timeout);
+            }, 1000);
         };
-        
-        function sendHubMessage() {
-            const msg = document.getElementById('hub-message').value;
+          function sendHubMessage() {
+            const msg = document.getElementById('hub-message').value.trim();
             if (msg) {
                 hubWs.send(msg);
                 document.getElementById('hub-message').value = '';
@@ -97,8 +137,47 @@ func runHubExample() {
         function logHub(text, isSystem = false) {
             const output = document.getElementById('hub-output');
             const div = document.createElement('div');
-            if (isSystem) div.className = 'system-msg';
-            div.textContent = text;
+            
+            if (isSystem) {
+                div.className = 'system-msg';
+                div.textContent = text;
+            } else {
+                div.className = 'user-msg';
+                
+                // Check if it's a user message
+                if (text.startsWith('User ')) {
+                    // Format user messages better
+                    const colonIndex = text.indexOf(':');
+                    if (colonIndex > 0) {
+                        const user = text.substring(0, colonIndex);
+                        const message = text.substring(colonIndex + 1).trim();
+                        
+                        // Create username element
+                        const userSpan = document.createElement('strong');
+                        userSpan.textContent = user + ': ';
+                        div.appendChild(userSpan);
+                        
+                        // Add message text
+                        const msgText = document.createTextNode(message);
+                        div.appendChild(msgText);
+                    } else {
+                        div.textContent = text;
+                    }
+                } else {
+                    div.textContent = text;
+                }
+            }
+            
+            // Add timestamp
+            const timestamp = new Date().toLocaleTimeString();
+            const timeSpan = document.createElement('span');
+            timeSpan.className = 'timestamp';
+            timeSpan.textContent = ' [' + timestamp + ']';
+            timeSpan.style.fontSize = '11px';
+            timeSpan.style.color = '#999';
+            div.appendChild(timeSpan);
+            
+            // Add to chat and scroll
             output.appendChild(div);
             output.scrollTop = output.scrollHeight;
         }
