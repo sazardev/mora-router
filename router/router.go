@@ -175,6 +175,16 @@ func (r *MoraRouter) Delete(pattern string, handler HandlerFunc) {
 	r.Handle("DELETE", pattern, handler)
 }
 
+// Patch registra un manejador para el método PATCH
+func (r *MoraRouter) Patch(pattern string, handler HandlerFunc) {
+	r.Handle("PATCH", pattern, handler)
+}
+
+// Options registra un manejador para el método OPTIONS
+func (r *MoraRouter) Options(pattern string, handler HandlerFunc) {
+	r.Handle("OPTIONS", pattern, handler)
+}
+
 // NotFound permite personalizar el manejador 404.
 func (r *MoraRouter) NotFound(handler HandlerFunc) {
 	r.notFound = handler

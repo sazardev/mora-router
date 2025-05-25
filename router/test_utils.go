@@ -84,6 +84,42 @@ func (r *TestResponse) IsServerError() bool {
 	return r.StatusCode >= 500 && r.StatusCode < 600
 }
 
+// IsClientError verifica si el código de estado es 4xx.
+func (r *TestResponse) IsClientError() bool {
+	return r.StatusCode >= 400 && r.StatusCode < 500
+}
+
+// IsNoContent verifica si el código de estado es 204 No Content.
+func (r *TestResponse) IsNoContent() bool {
+	return r.StatusCode == http.StatusNoContent
+}
+
+// IsAccepted verifica si el código de estado es 202 Accepted.
+func (r *TestResponse) IsAccepted() bool {
+	return r.StatusCode == http.StatusAccepted
+}
+
+// IsForbidden verifica si el código de estado es 403 Forbidden.
+func (r *TestResponse) IsForbidden() bool {
+	return r.StatusCode == http.StatusForbidden
+}
+
+// IsUnauthorized verifica si el código de estado es 401 Unauthorized.
+func (r *TestResponse) IsUnauthorized() bool {
+	return r.StatusCode == http.StatusUnauthorized
+}
+
+// HasHeader verifica si existe una cabecera HTTP.
+func (r *TestResponse) HasHeader(header string) bool {
+	_, ok := r.Header[header]
+	return ok
+}
+
+// DecodeJSON deserializa una respuesta JSON en el objeto dado.
+func (r *TestResponse) DecodeJSON(v interface{}) error {
+	return json.Unmarshal(r.Body, v)
+}
+
 // Get hace una petición GET a la ruta dada.
 func (c *TestClient) Get(path string) *TestResponse {
 	req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -208,4 +244,69 @@ func (c *TestClient) exec(req *http.Request) *TestResponse {
 		Header:     rr.Header(),
 		recorder:   rr,
 	}
+}
+
+// Options hace una petición OPTIONS a la ruta dada.
+func (c *TestClient) Options(path string) *TestResponse {
+	req := httptest.NewRequest(http.MethodOptions, path, nil)
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	return c.exec(req)
+}
+
+// GetJSON hace una petición GET y espera una respuesta JSON.
+func (c *TestClient) GetJSON(path string) *TestResponse {
+	return c.WithHeader("Accept", "application/json").Get(path)
+}
+
+// PostJSON hace una petición POST con un cuerpo JSON.
+func (c *TestClient) PostJSON(path string, payload interface{}) *TestResponse {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		panic("failed to marshal JSON: " + err.Error())
+	}
+
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	return c.exec(req)
+}
+
+// PutJSON hace una petición PUT con un cuerpo JSON.
+func (c *TestClient) PutJSON(path string, payload interface{}) *TestResponse {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		panic("failed to marshal JSON: " + err.Error())
+	}
+
+	req := httptest.NewRequest(http.MethodPut, path, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	return c.exec(req)
+}
+
+// PatchJSON hace una petición PATCH con un cuerpo JSON.
+func (c *TestClient) PatchJSON(path string, payload interface{}) *TestResponse {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		panic("failed to marshal JSON: " + err.Error())
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, path, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	return c.exec(req)
 }
