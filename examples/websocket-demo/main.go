@@ -4,12 +4,18 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/sazardev/mora-router/router"
 )
 
 func main() {
+	// Check if we should run the hub example
+	if len(os.Args) > 1 && os.Args[1] == "hub" {
+		runHubExample()
+		return
+	}
 	// Create router with WebSocket support
 	r := router.New(router.WithGorillaWebSocket())
 
